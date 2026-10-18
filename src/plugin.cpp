@@ -3,6 +3,11 @@
 #include <D2RLPlugin/inventory.h>
 #include <D2RLPlugin/lifecycle_events.h>
 #include "ground_quantity_label.hpp"
+#include "ground_label_background.hpp"
+#include "native_drop_sound.hpp"
+#include "maps_socket_runtime.hpp"
+#include "controller_ground_label.hpp"
+#include "controller_ground_label_witnesses.hpp"
 #include "ground_visibility_policy.hpp"
 #include "native_pickup_guard_policy.hpp"
 #include "filter_rule_engine.hpp"
@@ -34,6 +39,7 @@
 #include <D2RLPlugin/threads.h>
 #include <Windows.h>
 #include <intrin.h>
+#pragma comment(lib, "Version.lib")
 
 #include <algorithm>
 #include <array>
@@ -45,6 +51,7 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -65,6 +72,101 @@
 
 namespace UnHoarder {
 namespace {
+
+// Accepted D2RLoader build names. The same game release reports a different
+// build number per storefront (Battle.net = 93847, Steam = 93787). This gate is
+// only a coarse pre-filter: every native hook/read is still independently
+// guarded by CheckExpectedBytes fingerprints, so an incompatible image will
+// still be refused safely.
+constexpr std::string_view SupportedBuilds[] = {
+    "93847", // Battle.net
+    "93787", // Steam
+};
+
+inline bool IsSupportedBuild(const char* build) noexcept {
+    if (!build) return false;
+    const std::string_view name(build);
+    for (const auto supported : SupportedBuilds)
+        if (name == supported) return true;
+    return false;
+}
+
+// Returns the trailing dotted component of a version string such as
+// "3.3.93787" -> "93787". Empty when no digits are present.
+inline std::string TrailingBuildComponent(std::string_view version) {
+    while (!version.empty() && (version.back() == '\0' || version.back() == ' '))
+        version.remove_suffix(1);
+    const auto dot = version.find_last_of('.');
+    if (dot != std::string_view::npos) version.remove_prefix(dot + 1);
+    if (version.empty()) return {};
+    for (const char c : version)
+        if (c < '0' || c > '9') return {};
+    return std::string(version);
+}
+
+// Reads the FileVersion string ("3.3.93787") from the host process image.
+// The numeric VS_FIXEDFILEINFO cannot hold builds > 65535, so use the string.
+inline std::string ReadHostExeBuild() {
+    wchar_t path[MAX_PATH]{};
+    if (!GetModuleFileNameW(nullptr, path, MAX_PATH)) return {};
+    DWORD handle = 0;
+    const DWORD size = GetFileVersionInfoSizeW(path, &handle);
+    if (!size) return {};
+    std::vector<std::uint8_t> data(size);
+    if (!GetFileVersionInfoW(path, 0, size, data.data())) return {};
+    struct LangCodePage { WORD lang; WORD codePage; };
+    LangCodePage* translations = nullptr;
+    UINT translationBytes = 0;
+    if (!VerQueryValueW(data.data(), L"\\VarFileInfo\\Translation",
+            reinterpret_cast<void**>(&translations), &translationBytes) ||
+        !translations || translationBytes < sizeof(LangCodePage)) return {};
+    for (UINT i = 0; i < translationBytes / sizeof(LangCodePage); ++i) {
+        for (const wchar_t* key : {L"FileVersion", L"ProductVersion"}) {
+            wchar_t query[96]{};
+            std::swprintf(query, std::size(query), L"\\StringFileInfo\\%04x%04x\\%s",
+                translations[i].lang, translations[i].codePage, key);
+            wchar_t* value = nullptr;
+            UINT chars = 0;
+            if (!VerQueryValueW(data.data(), query, reinterpret_cast<void**>(&value), &chars) ||
+                !value || !chars) continue;
+            std::string narrow;
+            for (const wchar_t* p = value; *p; ++p)
+                narrow.push_back(*p < 0x80 ? static_cast<char>(*p) : '?');
+            auto build = TrailingBuildComponent(narrow);
+            if (!build.empty()) return build;
+        }
+    }
+    return {};
+}
+
+// D2RLoader 1.3.1 may hand plugins a PluginContext that is smaller than the
+// pinned SDK's sizeof(PluginContext) (so D2RL::GetBuildName returns nullptr),
+// or leave buildName unset on some launch platforms (observed: Steam). Resolve
+// the build defensively: raw buildName -> buildVersion -> D2R.exe FileVersion.
+inline const char* ResolveBuildName(const D2RL::PluginContext* ctx) noexcept {
+    static std::once_flag once;
+    static std::string cached;
+    try {
+        std::call_once(once, [ctx] {
+            auto covers = [ctx](std::size_t offset) {
+                return ctx && ctx->contextSize >= offset + sizeof(const char*);
+            };
+            if (covers(offsetof(D2RL::PluginContext, buildName)) &&
+                ctx->buildName && *ctx->buildName) {
+                cached = ctx->buildName;
+                return;
+            }
+            if (covers(offsetof(D2RL::PluginContext, buildVersion)) && ctx->buildVersion) {
+                cached = TrailingBuildComponent(ctx->buildVersion);
+                if (!cached.empty()) return;
+            }
+            cached = ReadHostExeBuild();
+        });
+    } catch (...) {
+        return nullptr;
+    }
+    return cached.empty() ? nullptr : cached.c_str();
+}
 
 // Qualifies against the 93847 process, not a declaration that this is a label function.
 // D2 item codes occupy four native bytes, but many Excel codes have only
@@ -213,7 +315,6 @@ constexpr std::size_t MaximumFilterNameBytes = 79; // measured in BYTES (no NUL)
 // UnHoarder forwards a stack-local replacement pointer for the synchronous
 // draw only; it never persists color data into the native label record.
 constexpr std::uintptr_t GroundColorOffset = 0x14;
-constexpr std::array<float,4> OriginalGroundBackground{{0.0f,0.0f,0.0f,0.6f}};
 std::atomic_bool BackgroundTintArmed{};
 std::atomic_bool HideGroundArmed{};
 
@@ -421,8 +522,8 @@ bool TryAcquireCooperativeGroundQuantityReader(
 void QualifyGroundQuantityReader() noexcept {
     GroundQuantityReader.store(nullptr,std::memory_order_release);
     (void)GroundQuantityCompatLease.Reset();
-    if (!Context || !Context->exeBase || !D2RL::GetBuildName(Context) ||
-        std::string_view(D2RL::GetBuildName(Context))!="93847") return;
+    if (!Context || !Context->exeBase || !ResolveBuildName(Context) ||
+        !IsSupportedBuild(ResolveBuildName(Context))) return;
     const auto base=static_cast<std::uintptr_t>(Context->exeBase);
     std::array<std::uint8_t,10> entry{};
     SIZE_T copied{};
@@ -950,8 +1051,8 @@ GroundPropertyLive::Scalars ReadNativeGroundQualityLevel(
     };
     if(reason)*reason="ok";
     if (!nativeUnit || !expectedId || !Context ||
-        !D2RL::GetBuildName(Context) ||
-        std::string_view(D2RL::GetBuildName(Context))!="93847")
+        !ResolveBuildName(Context) ||
+        !IsSupportedBuild(ResolveBuildName(Context)))
         return fail("unit-or-build-unavailable");
     std::array<std::uint8_t,0x18> before{},after{};
     SIZE_T copied{};
@@ -1023,10 +1124,20 @@ bool ReadNativeGroundSockets(const void* nativeUnit,
     GroundPropertyLive::Purpose purpose,std::uint32_t& sockets) noexcept {
     sockets=0; // meaningful ONLY when the return value is true
     if(!nativeUnit || !expectedId || !Context ||
-       !D2RL::GetBuildName(Context) ||
-       std::string_view(D2RL::GetBuildName(Context))!="93847") return false;
+       !ResolveBuildName(Context) ||
+       !IsSupportedBuild(ResolveBuildName(Context))) return false;
     const auto getter=GroundQuantityReader.load(std::memory_order_acquire);
-    if(!getter) return false; // never interpret missing bridge as zero sockets
+    // A missing general stat service is never interpreted as zero sockets.
+    // The alternate capability admits only the exact Maps stat-194 path.
+    const auto readSocket=[&](std::int64_t& value) noexcept {
+        if (getter) {value=getter(const_cast<void*>(nativeUnit),GroundSocketStatId,0);return true;}
+        const bool ok=MapsSocket::Read(Context->exeBase,const_cast<void*>(nativeUnit),value);
+        if (ok) {
+            static std::atomic_bool reported{};
+            if (!reported.exchange(true)) LogInfo("LOOT_SOCKET_READER_READY stat=194 layer=0 source=exact-Maps-forwarding item-only=1 original-called-once=1 ownership-rechecked-per-read=1");
+        }
+        return ok;
+    };
     std::array<std::uint32_t,4> before{},after{};
     SIZE_T copied{};
     if(!ReadProcessMemory(GetCurrentProcess(),nativeUnit,before.data(),
@@ -1034,15 +1145,15 @@ bool ReadNativeGroundSockets(const void* nativeUnit,
        before[0]!=4 || before[1]!=expectedClassId ||
        before[2]!=expectedId ||
        !GroundPropertyLive::AllowsMode(before[3],purpose)) return false;
-    const auto first=getter(const_cast<void*>(nativeUnit),
-        GroundSocketStatId,0);
+    std::int64_t first{};
+    if (!readSocket(first)) return false;
     copied=0;
     if(!ReadProcessMemory(GetCurrentProcess(),nativeUnit,after.data(),
         sizeof(after),&copied) || copied!=sizeof(after) ||
        before!=after) return false;
     // Two matching scalar reads protect against a transient stat result.
-    const auto second=getter(const_cast<void*>(nativeUnit),
-        GroundSocketStatId,0);
+    std::int64_t second{};
+    if (!readSocket(second)) return false;
     copied=0;
     std::array<std::uint32_t,4> finalHeader{};
     if(!ReadProcessMemory(GetCurrentProcess(),nativeUnit,finalHeader.data(),
@@ -1258,9 +1369,6 @@ void ResetNativeRowLiveSession() noexcept;
 void EnableAutomaticNativeHover() noexcept;
 bool TryAttachInWorldLabelCompat() noexcept;
 void DetachInWorldLabelCompat() noexcept;
-void ObserveGroundSoundIdentity(std::uint32_t unitId,
-    std::uint32_t rawCode,const void* nativeUnit,
-    std::uint32_t knownClassId) noexcept;
 void ObserveNativeRowLiveLabel(std::int32_t type,
     std::uint32_t classId,std::uint32_t unitId,std::uint32_t rawCode,
     const void* nativeUnit,const char* source,std::uint32_t sourceLength) noexcept;
@@ -1623,8 +1731,8 @@ void QualifyVendorSellPrice() noexcept {
     VendorSellPriceRequalifyNextGame.store(false,std::memory_order_release);
     ResetVendorSellPriceSession();
 
-    const char* build=Context?D2RL::GetBuildName(Context):nullptr;
-    if(!Context || !build || std::string_view(build)!="93847" ||
+    const char* build=Context?ResolveBuildName(Context):nullptr;
+    if(!Context || !IsSupportedBuild(build) ||
        !Base || !ImageSize) {
         LogWarn("LOOT_SELL_PRICE_REFUSED reason=unexpected-build-or-image");
         return;
@@ -2076,8 +2184,8 @@ void ArmNativeRowRuntime() noexcept {
 
         return;
     }
-    const char* build=Context?D2RL::GetBuildName(Context):nullptr;
-    if (!Context || !Base || !build || std::string_view(build)!="93847") {
+    const char* build=Context?ResolveBuildName(Context):nullptr;
+    if (!Context || !Base || !IsSupportedBuild(build)) {
         LogWarn("LOOT_NATIVE_ROW_REFUSED version=" UNHOARDER_VERSION_STRING " reason=build-or-base no-hook=1 no-fallback=1");
         return;
     }
@@ -3225,6 +3333,11 @@ bool ReloadFilterRules() {
     }
 }
 
+// Controller formatter uses R8 for temporary geometry, not the item label.
+// This TLS scope comes only from the separately fingerprinted controller CALL.
+std::atomic_bool ControllerGroundLabelsReady{};
+thread_local ControllerGroundLabel::Scope ControllerGroundScope{};
+
 // Read/write a *specific* 93847 ground-name output region only. The native
 // inner writer is invoked first; our substitution happens while its parent
 // formatter has NOT YET measured text or calculated x/y/width/height.
@@ -3258,7 +3371,8 @@ std::uint64_t __fastcall HookInnerNameWriter(
             &recordId, sizeof(recordId), &copied) || copied != sizeof(recordId)) {
         return result;
     }
-    if (recordId != header[2]) {
+    if (recordId != header[2] &&
+        !ControllerGroundScope.Owns(unit,output,header[2])) {
         return result;
     }
     const auto code = CanonicalItemCode(OriginalGetItemCode(unit)); // original helper trampoline
@@ -3352,8 +3466,8 @@ void ArmInnerNameWriter() noexcept {
         LogInfo("LOOT_GEOMETRY_HOOK_READY already-installed=1");
         return;
     }
-    if (!Context || !D2RL::GetBuildName(Context) ||
-        std::string_view(D2RL::GetBuildName(Context)) != "93847" ||
+    if (!Context || !ResolveBuildName(Context) ||
+        !IsSupportedBuild(ResolveBuildName(Context)) ||
         !FormatterHookInstalled.load(std::memory_order_acquire) ||
         !OriginalLabelFormatter || !OriginalGetItemCode ||
         !HookInstalled.load(std::memory_order_acquire)) {
@@ -3384,7 +3498,7 @@ void ArmInnerNameWriter() noexcept {
 // The painter may read a separate label record, so match unit ID, recent
 // formatter observation, and exact label text; NEVER compare record pointers.
 void RememberGroundIdentity(void* unit, void* record, bool sourceCall,
-                           bool paired, std::uint8_t result) noexcept {
+                           bool paired, std::uint8_t result, bool controller=false) noexcept {
     if (ActiveGeometryMode.load(std::memory_order_acquire)!=GeometryMode::Rules ||
         !sourceCall || !paired || !result || !unit || !record ||
         !OriginalGetItemCode || !HookInstalled.load(std::memory_order_acquire)) return;
@@ -3397,7 +3511,10 @@ void RememberGroundIdentity(void* unit, void* record, bool sourceCall,
         return;
     }
     copied=0;
-    if (!ReadProcessMemory(GetCurrentProcess(),
+    if (controller) {
+        if (!ControllerGroundScope.Owns(unit,reinterpret_cast<void*>(address+0x24),header[2])) return;
+        recordId=header[2]; // native caller publishes this ID AFTER the formatter returns
+    } else if (!ReadProcessMemory(GetCurrentProcess(),
         reinterpret_cast<const void*>(address+0x10),&recordId,
         sizeof(recordId),&copied) || copied!=sizeof(recordId) ||
         recordId!=header[2]) {
@@ -3515,7 +3632,9 @@ void __cdecl UnHoarderSharedLabelPaintMiddleware(
     void*,std::uintptr_t caller,
     void* rect,void* textArg,void* colorArg,
     TooltipCompat::SharedLabelPaintNextFn next,void* nextContext) noexcept {
-    const bool ground=caller==Base+0x1517AF6;
+    const bool ground=caller==Base+0x1517AF6 ||
+        (ControllerGroundLabelsReady.load(std::memory_order_acquire) &&
+         caller==Base+ControllerGroundLabel::PaintReturn);
     const bool rulesActive=ActiveGeometryMode.load(std::memory_order_acquire)==GeometryMode::Rules;
     const bool tint=rulesActive && BackgroundTintArmed.load(std::memory_order_acquire);
     const bool hide=rulesActive && HideGroundArmed.load(std::memory_order_acquire);
@@ -3580,8 +3699,7 @@ void __cdecl UnHoarderSharedLabelPaintMiddleware(
             }
 
             if (tint && !concealGroundVisuals && rule && rule->hasBackground &&
-                nameMatches && std::memcmp(rgba.data(),OriginalGroundBackground.data(),
-                    sizeof(rgba))==0) {
+                nameMatches && GroundLabelBackground::KnownNativeBlack(rgba)) {
                 forwardedRgba=rule->background;
                 forwardedColor=forwardedRgba.data();
             }
@@ -3924,7 +4042,6 @@ void __cdecl OnCompatibleInWorldLabel(
         OriginalGetItemCode(const_cast<void*>(event->nativeUnit)));
     if (!PrintableItemCode(code)) return;
     ObserveMinimapItemPosition(event->nativeUnit,code,event->unitId,event->classId);
-    ObserveGroundSoundIdentity(event->unitId,code,event->nativeUnit,event->classId);
     ObserveNativeRowLiveLabel(event->unitType,event->classId,event->unitId,code,
         event->nativeUnit,event->source,event->sourceLength);
 }
@@ -3969,8 +4086,8 @@ bool __cdecl OnCompatibleInWorldStyle(
 bool TryAttachInWorldLabelCompat() noexcept {
     if (InWorldCompatLease && InWorldCompatService.load(std::memory_order_acquire))
         return true;
-    if (!Context || !D2RL::GetBuildName(Context)
-        || std::string_view(D2RL::GetBuildName(Context))!="93847") return false;
+    if (!Context || !ResolveBuildName(Context)
+        || !IsSupportedBuild(ResolveBuildName(Context))) return false;
     std::array<char,64> owner{};
     if (!DiagnoseTrackedTooltipOwner(InWorldFormatterRva,
             ExpectedInWorldFormatter.data(),
@@ -4395,8 +4512,8 @@ void ArmCorrectedGlyphB() noexcept {
         LogInfo("LOOT_GLYPH_B_ARMED version=" UNHOARDER_VERSION_STRING " already-installed=1 abi=RCX,XMM1,XMM2,R9-pointer hookA=0");
         return;
     }
-    const char* build=Context ? D2RL::GetBuildName(Context) : nullptr;
-    if (!Context || !build || std::string_view(build)!="93847" ||
+    const char* build=Context ? ResolveBuildName(Context) : nullptr;
+    if (!Context || !IsSupportedBuild(build) ||
         !FormatterHookInstalled.load(std::memory_order_acquire) ||
         !InnerNameHookInstalled.load(std::memory_order_acquire) ||
         !BackgroundPaintHookInstalled.load(std::memory_order_acquire) ||
@@ -4475,14 +4592,14 @@ void SyncFilterTextColorState() noexcept {
 
 void EnsureSharedLabelPaintHook() noexcept {
     if (BackgroundPaintHookInstalled.load(std::memory_order_acquire)) return;
-    const char* build=Context ? D2RL::GetBuildName(Context) : nullptr;
+    const char* build=Context ? ResolveBuildName(Context) : nullptr;
     constexpr std::array<std::uint8_t,17> expected{{
         0x48,0x89,0x5C,0x24,0x10,0x48,0x89,0x74,0x24,0x18,
         0x57,0x48,0x83,0xEC,0x40,0x49,0x8B}};
     constexpr std::array<std::uint8_t,5> groundCall{{0xE8,0xEA,0x2D,0xCE,0xFE}};
     constexpr std::array<std::uint8_t,5> neighborCall{{0xE8,0x9A,0x0A,0xCE,0xFE}};
     std::array<std::uint8_t,5> groundBytes{},neighborBytes{};
-    if (!Context || !build || std::string_view(build)!="93847" ||
+    if (!Context || !IsSupportedBuild(build) ||
         !FormatterHookInstalled.load(std::memory_order_acquire) ||
         !OriginalLabelFormatter ||
         !ReadSafe(0x1517AF1,groundBytes.data(),groundBytes.size()) ||
@@ -4647,14 +4764,14 @@ void EnableAutomaticNativeHover() noexcept {
 }
 
 
-// Per-game first-observed-unit sound alert. The Alt-ground-label and optional
-// Qualified ground-label observations feed one registry. The public
+// Native drop-sound replacement. Each qualified native audio event resolves
+// one rule; label observers never enqueue audio. The public
 // InventoryService is polled on the UI thread: seeing an existing, alerted
 // unit ID in the player's owned inventory or cursor FORGETS precisely that ID.
-// A later ground observation of the same unit can play another sound. This
-// does not hook monster/TC drops or infer pickup from missing labels.
+// A later native drop of the same unit can play another sound immediately. This
+// does not modify monster/TC drops or infer pickup from missing labels.
 // Sound resolution still uses the qualified D2RLoader sounds.txt row-NAME
-// backend on the game thread, not the sounds.txt numeric Index or FMOD.
+// backend inside the original native audio callback, not a numeric Index or FMOD.
 const D2RL::ThreadService* SoundThreads{};
 const D2RL::InventoryService* SoundInventory{};
 const D2RL::ItemService* SoundInventoryItems{};
@@ -4663,9 +4780,7 @@ std::atomic_bool SoundPickupPollPending{};
 constexpr auto SoundPickupPollInterval=std::chrono::milliseconds(150);
 std::atomic<std::uintptr_t> SoundLoaderBase{};
 std::atomic_bool SoundArmed{};
-std::atomic<ULONGLONG> SoundArmMs{};
 std::atomic<std::uint64_t> SoundRegistryEpoch{1};
-constexpr ULONGLONG SoundBaselineMs=1500;
 SoundIdentity::Registry SoundSeenRegistry{};
 std::mutex SoundSeenMutex;
 
@@ -4783,128 +4898,82 @@ bool SoundMemoryRead(std::uintptr_t addr,void* data,std::size_t size) noexcept {
         "LOOT_SOUND_QUALIFY matched=1 version=" UNHOARDER_VERSION_STRING " "
         "layout=%s nativeNamePlayer=D2RLoader+0x1A0C00 "
         "witnesses=%zu callChain=3 registration=exact executePage=1 "
-        "nameBased=1 gameThreadRequired=1 rowIndexNotUsed=1",
+        "nameBased=1 nativeAudioCallbackRequired=1 rowIndexNotUsed=1",
         SoundLoaderIdentity::Name(layout),matched);
     LogInfo(msg);
     return true;
 }
 
-struct SoundRequest {
-    std::array<char,64> name{};
-    std::uint32_t unitId{},code{};
-    std::uint64_t registryEpoch{}, itemTicket{};
-};
-void __cdecl PlayNamedSoundOnGameThread(
-    const D2RL::PluginContext* logger,void* requestArg) noexcept {
-    std::unique_ptr<SoundRequest> request(static_cast<SoundRequest*>(requestArg));
-    if(!request || !request->name[0])return;
-    if(!SoundArmed.load(std::memory_order_acquire) ||
-       request->registryEpoch != SoundRegistryEpoch.load(std::memory_order_acquire)) {
-        return;
-    }
-    // A pickup must cancel a queued old alert even if this unit is
-    // re-dropped (and re-registered) within the same game epoch.
-    if (!SoundSeenMutex.try_lock()) return;
-    const bool valid = request->registryEpoch ==
-        SoundRegistryEpoch.load(std::memory_order_acquire) &&
-        SoundSeenRegistry.IsCurrent(request->unitId, request->itemTicket);
-    SoundSeenMutex.unlock();
-    if (!valid) return;
+bool TryReplaceNativeDropSound(void* unit,const NativeDropSound::Snapshot& snapshot) noexcept {
+    if (!SoundArmed.load(std::memory_order_acquire) || !OriginalGetItemCode ||
+        !HookInstalled.load(std::memory_order_acquire) ||
+        ActiveGeometryMode.load(std::memory_order_acquire)!=GeometryMode::Rules)return false;
     const auto base=SoundLoaderBase.load(std::memory_order_acquire);
-    if(!base)return;
+    const auto rules=PublishedFilterRules.load(std::memory_order_acquire);
+    if (!base || !rules || !rules->soundRules)return false;
+    const auto code=CanonicalItemCode(OriginalGetItemCode(unit));
+    const auto item=GroundRuleItem(code,unit,rules.get(),snapshot.id,
+        GroundPropertyLive::Purpose::VerifiedLabel);
+    GroundRuleDecision selected{};
+    if (!ResolveGroundRule(rules.get(),item,selected) || !selected.hasDropSound ||
+        !selected.dropSound[0])return false;
+    NativeDropSound::Snapshot current{};
+    if (!SoundMemoryRead(reinterpret_cast<std::uintptr_t>(unit),&current,sizeof(current)) ||
+        current.type!=snapshot.type || current.classId!=snapshot.classId ||
+        current.id!=snapshot.id || current.mode!=snapshot.mode)return false;
+    // The reviewed name player forwards RDX to the SAME native audio player
+    // as the intercepted routine. Keep the exact item in this native call's
+    // lifetime; no authoritative-thread queue is needed on remote clients.
     using PlayNamedFn=void* (__fastcall*)(const char*,void*,int,int);
     auto* player=reinterpret_cast<PlayNamedFn>(base+0x1A0C00U);
-    void* result=player(request->name.data(),nullptr,0,1);
-    char codeText[5]{};
-    CodeText(request->code,codeText);
-    char message[320]{};
+    void* result=player(selected.dropSound.data(),unit,0,0);
+    char codeText[5]{};CodeText(code,codeText);
+    char message[330]{};
     std::snprintf(message,sizeof(message),
-        "LOOT_SOUND_PLAY version=" UNHOARDER_VERSION_STRING " trigger=first-ground-label code='%s' unitId=%u name='%s' engineReturned=%u gameThread=%lu note=return-not-audibility-proof",
-        codeText,request->unitId,
-        request->name.data(),result?1U:0U,static_cast<unsigned long>(GetCurrentThreadId()));
-    if(logger) {
-        logger->LogInfo(message);
-    }
+        "LOOT_SOUND_PLAY version=" UNHOARDER_VERSION_STRING " trigger=native-item-drop code='%s' unitId=%u name='%s' engineReturned=%u nativeSuppressed=%u fallback=%s callbackThread=%lu note=return-not-audibility-proof",
+        codeText,snapshot.id,selected.dropSound.data(),result?1U:0U,result?1U:0U,
+        result?"none":"native",static_cast<unsigned long>(GetCurrentThreadId()));
+    LogInfo(message);
+    return result!=nullptr;
 }
 
-bool QueueNamedSound(std::string_view name,std::uint32_t unitId,
-                     std::uint32_t code,std::uint64_t observedEpoch,
-                     std::uint64_t itemTicket) noexcept {
-    if(name.empty() || name.size()>63 || !SoundThreads ||
-       !SoundThreads->runOnGameThread || !Context ||
-       !SoundLoaderBase.load(std::memory_order_acquire)) {
+using NativeDropPlayerFn=void (__fastcall*)(void*) noexcept;
+NativeDropPlayerFn OriginalNativeDropPlayer{};
+std::atomic_bool NativeDropSoundHookInstalled{};
+
+void __fastcall HookNativeDropPlayer(void* unit) noexcept {
+    const auto caller=reinterpret_cast<std::uintptr_t>(_ReturnAddress());
+    if (!SoundArmed.load(std::memory_order_acquire)) {
+        OriginalNativeDropPlayer(unit);
+        return;
+    }
+    NativeDropSound::Dispatch(caller>=Base?caller-Base:UINTPTR_MAX,unit,
+        [](void* item) noexcept {OriginalNativeDropPlayer(item);},
+        [](void* item,NativeDropSound::Snapshot& out) noexcept {
+            return SoundMemoryRead(reinterpret_cast<std::uintptr_t>(item),&out,sizeof(out));
+        },
+        [](void* item,const NativeDropSound::Snapshot& snapshot) noexcept {
+            return TryReplaceNativeDropSound(item,snapshot);
+        });
+}
+
+bool ArmNativeDropSoundHook() noexcept {
+    if (NativeDropSoundHookInstalled.load(std::memory_order_acquire))return OriginalNativeDropPlayer!=nullptr;
+    const auto* build=Context?ResolveBuildName(Context):nullptr;
+    if (!Context || !IsSupportedBuild(build) || !Base || !ImageSize ||
+        !NativeDropSound::Verify([](std::uintptr_t rva,void* out,std::size_t bytes) noexcept {return ReadSafe(rva,out,bytes);}) ||
+        !Context->CheckExpectedBytes(NativeDropSound::Rva,NativeDropSound::Witness0,20)) {
+        LogWarn("LOOT_SOUND_DROP_HOOK_REFUSED native-body-or-callsite-mismatch no-label-fallback=1 native-audio-preserved=1");
         return false;
     }
-    auto* request=new(std::nothrow) SoundRequest{};
-    if(!request) {
+    if (!Context->InstallInlineHook(NativeDropSound::Rva,NativeDropSound::Witness0,20,
+        HookNativeDropPlayer,&OriginalNativeDropPlayer) || !OriginalNativeDropPlayer) {
+        LogWarn("LOOT_SOUND_DROP_HOOK_REFUSED loader-install-failed no-label-fallback=1 native-audio-preserved=1");
         return false;
     }
-    std::memcpy(request->name.data(),name.data(),name.size());
-    request->name[name.size()]='\0';
-    request->unitId=unitId;request->code=code;
-    request->registryEpoch=observedEpoch;
-    request->itemTicket=itemTicket;
-    // The callback owns the raw allocation on Success. Never access it
-    // after dispatch: the service may run the callback synchronously if we
-    // are already on the game thread, and callback may have freed it.
-    const auto codeResult=SoundThreads->runOnGameThread(
-        Context,&PlayNamedSoundOnGameThread,request);
-    if(codeResult!=D2RL::Threads::Result::Success) {
-        delete request;
-        return false;
-    }
+    NativeDropSoundHookInstalled.store(true,std::memory_order_release);
+    LogInfo("LOOT_SOUND_DROP_HOOK_READY hook=D2R+0x1C8130 callerReturns=0x1C36A0,0x1C6C9E native-fallback-once=1 replacement=accepted-custom-only item-identity=before-after mode=ground-or-dropping label-dependency=0");
     return true;
-}
-
-// Shared, read-only identity sink. The rule is resolved BEFORE claiming an ID;
-// this keeps non-sound items out of the fixed-capacity sound registry. There
-// is no visibility timeout, cooldown, or label-based replay heuristic.
-void ObserveGroundSoundIdentity(std::uint32_t unitId,
-    std::uint32_t rawCode,const void* nativeUnit,
-    std::uint32_t knownClassId) noexcept {
-    if (!SoundArmed.load(std::memory_order_acquire) || !unitId ||
-        ActiveGeometryMode.load(std::memory_order_acquire)!=GeometryMode::Rules)
-        return;
-    const auto rules=PublishedFilterRules.load(std::memory_order_acquire);
-    if (!rules || !rules->soundRules) return;
-    const auto code=CanonicalItemCode(rawCode);
-    auto item=GroundRuleItem(code,nativeUnit,rules.get(),unitId,
-        GroundPropertyLive::Purpose::VerifiedLabel);
-    if(!item.classIdKnown && knownClassId!=0xffffffffU) {
-        item.classIdKnown=true;item.classId=knownClassId;
-    }
-    GroundRuleDecision resolvedRule{};
-    const auto* rule=ResolveGroundRule(rules.get(),item,resolvedRule) ?
-        &resolvedRule : nullptr;
-    if (!rule || !rule->hasDropSound) return;
-    if (!SoundSeenMutex.try_lock()) {
-        return;
-    }
-    const auto now=GetTickCount64();
-    const auto start=SoundArmMs.load(std::memory_order_relaxed);
-    const bool baseline=now>=start && now-start<SoundBaselineMs;
-    const auto observedEpoch=SoundRegistryEpoch.load(std::memory_order_acquire);
-    std::uint64_t itemTicket{};
-    const auto observation=SoundSeenRegistry.Observe(unitId,code,&itemTicket);
-    SoundSeenMutex.unlock();
-    if (observation!=SoundIdentity::Registry::Observation::New || baseline) return;
-    (void)QueueNamedSound(rule->dropSound.data(),unitId,code,
-        observedEpoch,itemTicket);
-}
-
-void ExamineGroundSoundCandidate(void* unit,void* record,bool sourceCall,
-                                  bool paired,std::uint8_t result) noexcept {
-    if(!SoundArmed.load(std::memory_order_acquire) || !result || !sourceCall ||
-       !paired || !unit || !record || !OriginalGetItemCode ||
-       ActiveGeometryMode.load(std::memory_order_acquire)!=GeometryMode::Rules)
-        return;
-    std::uint32_t header[4]{},recordId{};
-    if(!SoundMemoryRead(reinterpret_cast<std::uintptr_t>(unit),header,sizeof(header)) ||
-       header[0]!=4 || !header[2] ||
-       !SoundMemoryRead(reinterpret_cast<std::uintptr_t>(record)+0x10,
-                        &recordId,sizeof(recordId)) ||
-       recordId!=header[2]) return;
-    ObserveGroundSoundIdentity(header[2],OriginalGetItemCode(unit),unit,header[1]);
 }
 
 // Re-arm sounds ONLY after an explicit successful inventory/cursor
@@ -5042,7 +5111,7 @@ void StartSoundInventoryObserver() noexcept {
             D2RL::InventoryServiceRequiredSize) ||
         !inventory->getLocalPlayer || !inventory->forEachInventoryItem) {
         LogWarn("LOOT_SOUND_PICKUP_OBSERVER_UNAVAILABLE reason=public-inventory-service-missing "
-             "sounds-continue=1 same-id-redrop=not-rearmed");
+             "sounds-continue=1 minimap-pickup-poll=unavailable");
         return;
     }
     SoundInventory=inventory;
@@ -5058,14 +5127,14 @@ void StartSoundInventoryObserver() noexcept {
         SoundInventory=nullptr;
         SoundInventoryItems=nullptr;
         LogWarn("LOOT_SOUND_PICKUP_OBSERVER_UNAVAILABLE reason=worker-create-failed "
-             "sounds-continue=1 same-id-redrop=not-rearmed");
+             "sounds-continue=1 minimap-pickup-poll=unavailable");
         return;
     }
     char line[270]{};
     std::snprintf(line,sizeof(line),
         "LOOT_SOUND_PICKUP_OBSERVER_READY version=" UNHOARDER_VERSION_STRING " source=SDK-InventoryService "
         "intervalMs=150 includesCursor=%u nativeHooksAdded=0 inventoryWrites=0 "
-        "audio=first-observed-after-pickup minimapPickupLifecycle=shared-read-only",
+        "audio=native-drop-after-pickup minimapPickupLifecycle=shared-read-only",
         SoundInventoryItems ? 1U:0U);
     LogInfo(line);
 }
@@ -5073,24 +5142,23 @@ void StartSoundInventoryObserver() noexcept {
 void ArmNewGroundSound() noexcept {
     SoundArmed.store(false,std::memory_order_release);
     auto rules=PublishedFilterRules.load(std::memory_order_acquire);
-    if(!Context || !SoundThreads || !SoundThreads->runOnGameThread ||
+    if(!Context ||
        !FormatterHookInstalled.load(std::memory_order_acquire) ||
        ActiveGeometryMode.load(std::memory_order_acquire)!=GeometryMode::Rules ||
-       !rules || !rules->soundRules || !QualifyNamedSoundBackend()) {
-        LogWarn("LOOT_SOUND_REFUSED reason=needs-filter-arm-sound-rules-ThreadService-and-qualified-native-soundplay");
+       !rules || !rules->soundRules || !QualifyNamedSoundBackend() || !ArmNativeDropSoundHook()) {
+        LogWarn("LOOT_SOUND_REFUSED reason=needs-filter-arm-sound-rules-and-qualified-native-drop-route");
         return;
     }
     {
         std::lock_guard lock(SoundSeenMutex);
         SoundRegistryEpoch.fetch_add(1,std::memory_order_acq_rel);
         SoundSeenRegistry.Clear();
-        SoundArmMs.store(GetTickCount64(),std::memory_order_release);
     }
     SoundArmed.store(true,std::memory_order_release);
     char message[340]{};
     std::snprintf(message,sizeof(message),
-        "LOOT_SOUND_ARMED version=" UNHOARDER_VERSION_STRING " mode=session-unit-id-first-observed source=qualified-ground-label soundRules=%zu baselineMs=%llu no-visibility-replay=1 same-id-redrop=rearm-on-inventory-observation no-item-writes=1 note=not-native-drop-event",
-        rules->soundRules,static_cast<unsigned long long>(SoundBaselineMs));
+        "LOOT_SOUND_ARMED version=" UNHOARDER_VERSION_STRING " mode=native-item-drop source=qualified-native-landing-sound soundRules=%zu labelsRequired=0 no-visibility-replay=1 same-id-redrop=per-native-event no-item-writes=1 normal-sound=fallback-on-no-selection-or-rejection",
+        rules->soundRules);
     LogInfo(message);
 }
 
@@ -5151,7 +5219,7 @@ bool ActivateConfiguredFilter(bool automatic) noexcept {
         EnableAutomaticNativeHover();
     else
         ResetNativeRowLiveSession();
-    // New files/initial activation use the existing first-observed baseline.
+    // New files/initial activation qualify the native drop route.
     // For live reloads, keep already-observed sound IDs while cancelling any
     // sounds queued from the previous generation (the old epoch).
     SoundArmed.store(false,std::memory_order_release);
@@ -5381,7 +5449,6 @@ void RebaselineSoundAtGameJoin() noexcept {
         std::lock_guard lock(SoundSeenMutex);
         SoundRegistryEpoch.fetch_add(1,std::memory_order_acq_rel);
         SoundSeenRegistry.Clear();
-        SoundArmMs.store(GetTickCount64(),std::memory_order_release);
     }
     LogInfo("LOOT_SOUND_GAME_BASELINE_RESET auto=1 previously-observed-items-baselined-for-1500ms=1");
 }
@@ -5402,10 +5469,30 @@ std::uint8_t __fastcall HookLabelFormatter(
         recordAddress <= static_cast<std::uintptr_t>(-1) - 0x24 &&
         destAddress == recordAddress + 0x24;
 
+    const auto previousScope=ControllerGroundScope;
+    ControllerGroundScope={};
+    bool controller=false;
+    if (ControllerGroundLabelsReady.load(std::memory_order_acquire) &&
+        caller==Base+ControllerGroundLabel::FormatterReturn && unit && dest &&
+        destAddress>=0x24 && destAddress<=UINTPTR_MAX-0x80) {
+        std::uint32_t header[3]{}; SIZE_T copied{};
+        if (ReadProcessMemory(GetCurrentProcess(),unit,header,sizeof(header),&copied) &&
+            copied==sizeof(header) && header[0]==4 && header[2] && header[2]!=UINT32_MAX) {
+            ControllerGroundScope={unit,dest,header[2]};
+            controller=true;
+        }
+    }
     const auto result = OriginalLabelFormatter(
         unit, dest, record, flags, stack5, stack6);
-    RememberGroundIdentity(unit, record, sourceCall, paired, result);
-    ExamineGroundSoundCandidate(unit, record, sourceCall, paired, result);
+    if (controller) {
+        // R8 is temporary geometry here. The output-bearing record is RDX-0x24;
+        // identity is supplied by the exact native unit in this same call scope.
+        RememberGroundIdentity(unit,reinterpret_cast<void*>(destAddress-0x24),
+            true,true,result,true);
+    } else {
+        RememberGroundIdentity(unit, record, sourceCall, paired, result);
+    }
+    ControllerGroundScope=previousScope;
     return result;
 }
 
@@ -5414,8 +5501,8 @@ void ArmLabelFormatter() noexcept {
         LogInfo("LOOT_FORMATTER_OBSERVER_READY already-installed=1");
         return;
     }
-    const char* build = Context ? D2RL::GetBuildName(Context) : nullptr;
-    if (!Context || !build || std::string_view(build) != "93847" ||
+    const char* build = Context ? ResolveBuildName(Context) : nullptr;
+    if (!Context || !IsSupportedBuild(build) ||
         !Base || !ImageSize) {
         LogWarn("LOOT_FORMATTER_REFUSED unexpected-build-or-uninitialized-image");
         return;
@@ -5441,6 +5528,13 @@ void ArmLabelFormatter() noexcept {
         return;
     }
     FormatterHookInstalled.store(true,std::memory_order_release);
+    const bool controllerRoute=ControllerGroundLabel::Verify(
+        [](std::uintptr_t rva,void* out,std::size_t size) noexcept {return ReadSafe(rva,out,size);});
+    ControllerGroundLabelsReady.store(controllerRoute,std::memory_order_release);
+    if (controllerRoute)
+        LogInfo("LOOT_CONTROLLER_LABEL_ROUTE_READY formatterReturn=0x151A2B2 paintReturn=0x1519E46 unit-output-scope=exact recordId=published-after-format recordWrites=0");
+    else
+        LogWarn("LOOT_CONTROLLER_LABEL_ROUTE_REFUSED fingerprint-mismatch default-controller-labels-preserved=1");
     LogInfo("LOOT_FORMATTER_OBSERVER_READY version=" UNHOARDER_VERSION_STRING " hook=D2R+0x1FA9F0 sourceCalls=D2R+0x15171E5,D2R+0x1517783 expectedReturnRvas=0x15171EA,0x1517788 sixArgsForwarded=1 labelWrites=none nativeCodeWrites=loader-managed-hook-only");
 }
 
@@ -5540,8 +5634,8 @@ bool NativeCallMatches(std::uintptr_t callRva,
 
 void InstallNativePickupGuard() noexcept {
     if(!Context || !Base || !ImageSize ||
-       !D2RL::GetBuildName(Context) ||
-       std::string_view(D2RL::GetBuildName(Context))!="93847"){
+       !ResolveBuildName(Context) ||
+       !IsSupportedBuild(ResolveBuildName(Context))){
         LogWarn("LOOT_PICKUP_GUARD_INACTIVE version=" UNHOARDER_VERSION_STRING " reason=wrong-build-or-image forward-only=1");
         return;
     }
@@ -5736,7 +5830,6 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
     Base = context->exeBase;
     SoundArmed.store(false,std::memory_order_relaxed);
     SoundLoaderBase.store(0,std::memory_order_relaxed);
-    SoundArmMs.store(0,std::memory_order_relaxed);
     SoundSeenRegistry.Clear();
     SoundRegistryEpoch.store(1);
     SoundPickupPollPending.store(false);
@@ -5805,13 +5898,22 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
         context->LogError("LOOT_FILTER_REFUSED invalid main D2R PE image");
         return false;
     }
-    const char* build = D2RL::GetBuildName(context);
+    const char* build = ResolveBuildName(context);
+    {
+        char diag[200]{};
+        std::snprintf(diag, sizeof(diag),
+            "LOOT_BUILD_DETECT contextSize=%u sdkContextSize=%u resolved=%s",
+            static_cast<unsigned>(context->contextSize),
+            static_cast<unsigned>(sizeof(D2RL::PluginContext)),
+            build ? build : "unknown");
+        LogInfo(diag);
+    }
     char msg[310]{};
     std::snprintf(msg, sizeof(msg),
-        "LOOT_FILTER_READY version=" UNHOARDER_VERSION_STRING " build=%s expectedBuild=93847 config=automatic",
+        "LOOT_FILTER_READY version=" UNHOARDER_VERSION_STRING " build=%s expectedBuild=93847|93787 config=automatic",
         build ? build : "unknown");
     LogInfo(msg);
-    if (!build || std::string_view(build) != "93847") {
+    if (!IsSupportedBuild(build)) {
         context->LogWarn("LOOT_FILTER_INACTIVE unexpected build, no native hook");
         return true;
     }
@@ -5844,6 +5946,7 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
 }
 
 D2RL_PLUGIN_EXPORT void D2RLoaderUnloadPlugin() noexcept {
+    MapsSocket::Shutdown();
     RuntimeWorkerStop();
     FirstFilterActivationPending.store(false,std::memory_order_release);
     FirstFilterActivationRetryRequested.store(false,std::memory_order_release);

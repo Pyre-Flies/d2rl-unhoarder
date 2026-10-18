@@ -1,30 +1,71 @@
 # UnHoarder
 
-**Author:** MindH1ve
+A loot filter for Diablo II: Resurrected running through D2RLoader.
 
-Standalone D2RLoader plugin providing a production JSON loot filter for Diablo II: Resurrected build 93847.
+**Original author: MindH1ve.** This is Pyre-Flies' fork of
+[Lukaszpg/d2rl-unhoarder](https://github.com/Lukaszpg/d2rl-unhoarder), carrying
+controller, sound and compatibility fixes for our Reimagined testing. The
+original author credits, plugin identity and GPL-3.0 license are retained.
 
-## Installation
+## What changed in this fork
 
-1. Head to releases and download the newest release - `unhoarder.dll` and `unhoarder-<version>-data.zip` are required.
-2. Place `unhoarder.dll` in `<D2R_installation_directory>\mods\<your_mod_name>\d2rloader\plugins`
-3. Unzip the downloaded ZIP, but do not copy it yet to your D2R directory.
-4. If you are:
-   
-  a) NOT Using a mod that modifies `sounds.txt` file - you can copy the unzipped contents to `<D2R_installation_directory>\mods\<your_mod_name>\<your_mod_name>.mpq\`
+- Apply filter names, colors and backgrounds to controller ground labels.
+- Play selected filter alerts when items drop, including when labels are hidden.
+  Successful filter playback replaces the ordinary drop sound; unavailable or
+  rejected playback falls back to the ordinary sound.
+- Route the bundled filter alerts through the game's Items volume control.
+- Restore socket-based rules with the specifically reviewed Maps companion.
 
-  b) If you are using a mod that modifies `sounds.txt` file, you have to manually add the filter alert sounds to that file, using for example [TXTEditor](https://github.com/yinyin333333/TXTeditor):
-  - Open the downloaded `sounds.txt` file
-  - Open the `sounds.txt` file of the mod you're using
-  - Copy `Filter01` to `Filter16` rows and add them to your mods `sounds.txt` at the end of the file
-  - Make sure to change the IDS in `Index` column
-  - Save the file
+Version **1.2.6 is staged for testing**. No binary release has been published for
+these changes. Use the team's staging ZIP or build this branch; upstream release
+assets do not include this fork's fixes. Keep the matching Controller QOL
+`1.3.1+rev.80-beta.7-sockets.1` build when using the tested plugin combination.
 
-## Building and installing a filter
+## Install or update
 
-In order to build a filter, head to [UnHoarder Builder](https://lukaszpg.github.io/unhoarder-builder/) site. Upload the required text files of the mod you're using (or vanilla if you're not using any huge overhaul mods) to enable autocomplete. Build your filter and then click `Download filter.json` at the top.
+With the game closed, back up your current files and put `unhoarder.dll` in:
 
-Place `filter.json` in `<D2R_installation_directory>\mods\<your_mod_name>\d2rloader\config`.
+`<D2R_installation_directory>\mods\<your_mod_name>\d2rloader\plugins`
+
+Keep your existing `filter.json` in:
+
+`<D2R_installation_directory>\mods\<your_mod_name>\d2rloader\config`
+
+Use [UnHoarder Builder](https://lukaszpg.github.io/unhoarder-builder/) to create
+or edit your rules. Saving a valid filter reloads it automatically;
+**Ctrl+Shift+F9** also reloads it. Invalid JSON leaves the last valid rules active.
+Updates should preserve your filter and other saved settings.
+
+### Filter sounds
+
+The DLL alone does not install the alerts. The matching data payload belongs
+inside the selected mod's MPQ/data tree and includes the 16 `Filter01` through
+`Filter16` audio files. If the mod already supplies `sounds.txt`, merge those
+rows into its existing table instead of replacing the table with the generic
+one. Preserve that mod's row indexes and unrelated values.
+
+For those 16 rows, set `Channel` to `sfx/items_hd` and `IsUI` to `0`. Keep the
+filenames, volume, pitch and other fields unchanged. A launcher that restores
+its own clean table must preserve these changes during package preparation.
+See [packaging notes](docs/PACKAGING.md).
+
+## Compatibility and testing
+
+Requires Windows x64 and the reviewed D2RLoader ABI-4 environment. The inherited
+native profile is qualified for D2R build 93847; individual companion paths are
+admitted only when their exact compatibility checks pass. A version label alone
+is not enough. Unsupported native paths remain disabled with a diagnostic.
+
+The staged code passed **37 CTest tests and 49 Python source checks**, plus
+artifact checks for the DLL's manifest, exports, identity and dependencies.
+Matching Controller QOL passed 55 tests. Earlier user testing confirmed the
+controller-label repair; the newest socket path has a read-only live forwarding
+audit. Visible socket-rule retesting, audible alert timing/fallback and Items
+volume behavior, and exhaustive client/server combinations remain pending.
+Automated checks do not establish full ladder qualification.
+
+See the [changelog](CHANGELOG.md) for the player-facing changes. Build-specific
+records live under [docs/](docs/) for contributors.
 
 ## Identity
 
