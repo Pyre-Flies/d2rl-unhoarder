@@ -20,10 +20,10 @@ original author credits, plugin identity and GPL-3.0 license are retained.
   pickup slots; QOL also applies this to unmodified controller pickup when
   `block_filtered_pickup` is enabled.
 
-Version **1.2.8 is staged for testing**. No binary release has been published for
-these changes. Use the team's staging ZIP or build this branch; upstream release
+Version **1.2.9 includes the user-confirmed background-opacity fix**. No binary
+release has been published for these changes. Use the team's staging ZIP or build this branch; upstream release
 assets do not include this fork's fixes. Keep the matching Controller QOL
-`1.3.1+rev.80-beta.7-visibility.2` build when using the tested plugin combination.
+`1.3.1+rev.80-beta.7-opacity.1` build when using the tested plugin combination.
 
 ## Install or update
 

@@ -1,5 +1,17 @@
 # UnHoarder changelog
 
+## 1.2.9 - background opacity compatibility
+
+- Apply filter backgrounds regardless of the native black-label opacity.
+  Preserve item, name, renderer and exact-black checks; malformed colors still
+  retain native rendering.
+- Use matching Controller QOL rev.80-beta.7-opacity.1 for the new artifact.
+  Controller pickup and visibility behavior are unchanged.
+
+Validation: 37 CTest tests, 51 Python source checks and 63 matching QOL tests
+pass. The new regression fails against the old opacity guard. The user
+confirmed the visual fix. No binary release is published by this source push.
+
 ## 1.2.8 - staged visibility update
 
 - Share filter visibility with matching Controller QOL so hidden loot does not
