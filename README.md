@@ -20,10 +20,12 @@ original author credits, plugin identity and GPL-3.0 license are retained.
   pickup slots; QOL also applies this to unmodified controller pickup when
   `block_filtered_pickup` is enabled.
 
-Version **1.2.9 includes the user-confirmed background-opacity fix**. No binary
-release has been published for these changes. Use the team's staging ZIP or build this branch; upstream release
-assets do not include this fork's fixes. Keep the matching Controller QOL
-`1.3.1+rev.80-beta.7-opacity.1` build when using the tested plugin combination.
+Version **1.2.9 includes the user-confirmed background-opacity fix**. Download
+the Reimagined upgrade from this fork's
+[latest release](https://github.com/Pyre-Flies/d2rl-unhoarder/releases/latest).
+Upstream release assets do not include this fork's fixes. Use Controller QOL
+`1.3.1+rev.80` from the consolidated D2R-Mods release if QOL is installed.
+Older staging builds remain historical rather than the current download.
 
 ## Install or update
 
