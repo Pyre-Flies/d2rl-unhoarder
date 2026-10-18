@@ -1,5 +1,19 @@
 # UnHoarder changelog
 
+## 1.2.8 - staged visibility update
+
+- Share filter visibility with matching Controller QOL so hidden loot does not
+  consume LB pickup slots. Use QOL rev.80-beta.7-visibility.2 for the latest
+  unmodified-controller pickup handling as well.
+- Retain the 1.2.7 label-only behavior: filtered labels can be hidden while
+  native pickup remains available. UnHoarder no longer intercepts pickup actions.
+- Preserve the controller labels, drop alerts and socket-rule fixes from 1.2.6.
+
+Validation: 37 CTest tests, 51 Python source checks and 61 matching QOL tests
+pass. Visible combined hide/pickup behavior, audible alert behavior and
+exhaustive hosted-game combinations remain pending. No binary release has
+been published for this branch. Original author credits and license are intact.
+
 ## 1.2.6 - staged fork update
 
 - Apply filter names, colors and backgrounds to controller ground labels.

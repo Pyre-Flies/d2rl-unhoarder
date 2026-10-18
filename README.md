@@ -15,11 +15,15 @@ original author credits, plugin identity and GPL-3.0 license are retained.
   rejected playback falls back to the ordinary sound.
 - Route the bundled filter alerts through the game's Items volume control.
 - Restore socket-based rules with the specifically reviewed Maps companion.
+- Hide filtered labels while leaving native pickup available. Share confirmed
+  visibility with matching Controller QOL so hidden loot does not consume LB
+  pickup slots; QOL also applies this to unmodified controller pickup when
+  `block_filtered_pickup` is enabled.
 
-Version **1.2.6 is staged for testing**. No binary release has been published for
+Version **1.2.8 is staged for testing**. No binary release has been published for
 these changes. Use the team's staging ZIP or build this branch; upstream release
 assets do not include this fork's fixes. Keep the matching Controller QOL
-`1.3.1+rev.80-beta.7-sockets.1` build when using the tested plugin combination.
+`1.3.1+rev.80-beta.7-visibility.2` build when using the tested plugin combination.
 
 ## Install or update
 
@@ -56,11 +60,11 @@ native profile is qualified for D2R build 93847; individual companion paths are
 admitted only when their exact compatibility checks pass. A version label alone
 is not enough. Unsupported native paths remain disabled with a diagnostic.
 
-The staged code passed **37 CTest tests and 49 Python source checks**, plus
+The staged code passed **37 CTest tests and 51 Python source checks**, plus
 artifact checks for the DLL's manifest, exports, identity and dependencies.
-Matching Controller QOL passed 55 tests. Earlier user testing confirmed the
+Matching Controller QOL passed 61 tests. Earlier user testing confirmed the
 controller-label repair; the newest socket path has a read-only live forwarding
-audit. Visible socket-rule retesting, audible alert timing/fallback and Items
+audit. Visible hide-rule and controller-pickup retesting, audible alert timing/fallback and Items
 volume behavior, and exhaustive client/server combinations remain pending.
 Automated checks do not establish full ladder qualification.
 

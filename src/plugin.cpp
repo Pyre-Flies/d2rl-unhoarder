@@ -10,6 +10,7 @@
 #include "controller_ground_label_witnesses.hpp"
 #include "ground_visibility_policy.hpp"
 #include "native_pickup_guard_policy.hpp"
+#include "ground_visibility_service.hpp"
 #include "filter_rule_engine.hpp"
 #include "base_name_table.hpp"
 #include "item_type_table.hpp"
@@ -2391,32 +2392,8 @@ bool TryNativeRowBgLive(void* element,std::uintptr_t caller) noexcept {
     // background. Do not inspect Alt/input state and do not mutate native
     // objects or the item's pickup/interaction state. Unlike bulk ground
     // paint, this row renderer handles only visual output for this label.
-    if (!rule->show) {
-        LARGE_INTEGER finalNow{};
-        const auto latest=NativeRowLiveLatestLabel;
-        if (!NativeRowBgLiveEnabled.load(std::memory_order_acquire) ||
-            NativeRowBgLiveEpoch.load(std::memory_order_acquire)!=epoch ||
-            NativeRowLiveLastAppend.appendSequence!=append.appendSequence ||
-            NativeRowLiveLastAppend.epoch!=epoch ||
-            latest.sequence!=append.labelSequence ||
-            latest.rulesGeneration!=append.rulesGeneration ||
-            !QueryPerformanceCounter(&finalNow) ||
-            !NativeRowBgLivePolicy::RecentChain(
-                append.qpc,finalNow.QuadPart,frequency.QuadPart) ||
-            rules->generation!=append.rulesGeneration ||
-            !GroundVisibility::SuppressHiddenHover(
-                HideGroundArmed.load(std::memory_order_acquire),
-                current.scopeMatches && current.unitId==append.unitId &&
-                    current.classId==append.classId && current.code==append.code,
-                append.qualified && append.appendSequence!=0,
-                append.row==reinterpret_cast<std::uintptr_t>(element),
-                exact,latest.rulesGeneration==append.rulesGeneration,
-                !rule->show)) {
-            NativeRowBgLiveRejected.fetch_add(1,std::memory_order_relaxed);
-            return false;
-        }
-        return true; // ONLY this fully verified hidden-hover row is not drawn
-    }
+    // Targeted labels remain native and usable even when bulk loot labels hide.
+    if (!rule->show) return false;
     if (!rule->hasBackground && !rule->hasTextColor) return false;
     if (NativeRowBgInsideRenderer ||
         NativeRowBgDrawGate.test_and_set(std::memory_order_acquire)) {
@@ -3935,6 +3912,49 @@ const D2RL::PluginCommunicationService* ResolvePluginCommunication() noexcept {
         return nullptr;
     PluginCommunication=service;
     return service;
+}
+
+UnhoarderVisibility::Decision __cdecl QueryGroundVisibility(
+    const void* unit,std::uint32_t guid,std::uint32_t code) noexcept {
+    using D=UnhoarderVisibility::Decision;
+    code=CanonicalItemCode(code);
+    if(!unit || !guid || !PrintableItemCode(code) || !OriginalGetItemCode ||
+       !HookInstalled.load(std::memory_order_acquire)) return D::Unknown;
+    if(!HideGroundArmed.load(std::memory_order_acquire) ||
+       ActiveGeometryMode.load(std::memory_order_acquire)!=GeometryMode::Rules)
+        return D::Visible;
+    const auto rules=PublishedFilterRules.load(std::memory_order_acquire);
+    if(!rules) return D::Unknown;
+    if(!rules->hiddenRules) return D::Visible;
+    std::array<std::uint32_t,4> before{},after{};SIZE_T copied{};
+    if(!ReadProcessMemory(GetCurrentProcess(),unit,before.data(),sizeof(before),&copied) ||
+       copied!=sizeof(before) || before[0]!=4 || before[2]!=guid || before[3]!=3)
+        return D::Unknown;
+    auto* mutableUnit=const_cast<void*>(unit);
+    if(CanonicalItemCode(OriginalGetItemCode(mutableUnit))!=code) return D::Unknown;
+    const auto item=GroundRuleItem(code,mutableUnit,rules.get(),guid);
+    GroundRuleDecision decision{};
+    const bool matched=ResolveGroundRule(rules.get(),item,decision);
+    if(!ReadProcessMemory(GetCurrentProcess(),unit,after.data(),sizeof(after),&copied) ||
+       copied!=sizeof(after) || before!=after ||
+       rules!=PublishedFilterRules.load(std::memory_order_acquire) ||
+       !HideGroundArmed.load(std::memory_order_acquire) ||
+       ActiveGeometryMode.load(std::memory_order_acquire)!=GeometryMode::Rules)
+        return D::Unknown;
+    if(!matched) return D::Unknown;
+    return decision.show?D::Visible:D::Hidden;
+}
+const UnhoarderVisibility::Service PublishedVisibilityService{
+    sizeof(UnhoarderVisibility::Service),UnhoarderVisibility::Version,&QueryGroundVisibility};
+void PublishGroundVisibilityService() noexcept {
+    const auto* service=ResolvePluginCommunication();
+    if(!service || !service->publishService) return;
+    const D2RL::PluginCommunication::PublishServiceRequest request{
+        .structSize=D2RL::PluginCommunication::PublishServiceRequestSize,.flags=0,
+        .name=UnhoarderVisibility::Name,.serviceVersion=UnhoarderVisibility::Version,
+        .tableSize=sizeof(PublishedVisibilityService),.table=&PublishedVisibilityService};
+    if(service->publishService(Context,&request)==D2RL::PluginCommunication::Result::Success)
+        LogInfo("LOOT_VISIBILITY_SERVICE_READY abi=1 presentation-only=1 native-pickup=unchanged");
 }
 
 void PublishTooltipCompatService() noexcept {
@@ -5930,6 +5950,7 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
     }
     HookInstalled.store(true, std::memory_order_release);
     PublishTooltipCompatService();
+    PublishGroundVisibilityService();
     (void)InstallStandaloneAutomapProjection();
     QualifyVendorSellPrice();
     // Reuse the qualified native filter pipeline automatically once the
@@ -5939,7 +5960,8 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
     else LogWarn("LOOT_FILTER_AUTO_INACTIVE reason=json-absent-or-invalid no-ground-label-feature-hooks=1");
     RegisterInWorldLifecycle();
     StartSoundInventoryObserver();
-    InstallNativePickupGuard();
+    // Hide rules affect label presentation only; do not intercept pickup.
+    LogInfo("LOOT_HIDE_PRESENTATION_ONLY pickup-dispatch-hook=none targeted-label=native");
     RuntimeWorkerStart();
 
     return true;
