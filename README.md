@@ -9,23 +9,29 @@ original author credits, plugin identity and GPL-3.0 license are retained.
 
 ## What changed in this fork
 
+**1.2.16** improves performance around visible loot and skips inventory scans
+when no active filter feature needs them. Both plugins work independently;
+use **Controller QOL 1.3.1+rev.89** when combining them. Both perf commands remain
+available. Live loot performance improved in user testing; complete ALT,
+controller and hosted interaction coverage remains open.
+
 - Apply filter names, colors and backgrounds to controller ground labels.
 - Play selected filter alerts when items drop, including when labels are hidden.
   Successful filter playback replaces the ordinary drop sound; unavailable or
   rejected playback falls back to the ordinary sound.
 - Route the bundled filter alerts through the game's Items volume control.
 - Restore socket-based rules with the specifically reviewed Maps companion.
-- Hide filtered labels while leaving native pickup available. Share confirmed
+- Block keyboard/mouse pickup of items hidden by a filter rule, including clicks
+  on their ground gear icon. Hold either keyboard ALT key to allow pickup.
+  Controller pickup retains its existing policy. Share confirmed
   visibility with matching Controller QOL so hidden loot does not consume LB
   pickup slots; QOL also applies this to unmodified controller pickup when
   `block_filtered_pickup` is enabled.
 
-Version **1.2.9 includes the user-confirmed background-opacity fix**. Download
-the Reimagined upgrade from this fork's
+Download **1.2.16** from this fork's
 [latest release](https://github.com/Pyre-Flies/d2rl-unhoarder/releases/latest).
-Upstream release assets do not include this fork's fixes. Use Controller QOL
-`1.3.1+rev.80` from the consolidated D2R-Mods release if QOL is installed.
-Older staging builds remain historical rather than the current download.
+It includes the earlier background, controller-label and sound fixes.
+Upstream release assets do not include this fork's changes.
 
 ## Install or update
 

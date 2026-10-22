@@ -4,5 +4,5 @@ a=s.index('UnhoarderVisibility::Decision __cdecl QueryGroundVisibility(');z=s.in
 for term in ['code=CanonicalItemCode(code)','before[0]!=4','before[2]!=guid','before[3]!=3','OriginalGetItemCode(mutableUnit)','GroundRuleItem(code,mutableUnit,rules.get(),guid)','ResolveGroundRule(rules.get(),item,decision)','before!=after','rules!=PublishedFilterRules.load','return D::Unknown','return decision.show?D::Visible:D::Hidden']:
  assert term in body,term
 assert 'WriteProcessMemory' not in body and 'InstallInlineHook' not in body
-assert s.count('InstallNativePickupGuard(')==1
-print('Read-only visibility: fresh identity/rules, stable headers, canonical codes and generation; no native pickup interception.')
+assert 'InstallNativePickupGuard' not in body
+print('Read-only visibility: fresh identity/rules, stable headers, canonical codes and generation; visibility callback never intercepts pickup.')

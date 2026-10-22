@@ -1,5 +1,15 @@
 # UnHoarder changelog
 
+## 1.2.16 - 2026-10-21
+
+- Improve loot-label performance, including when Controller QOL is enabled.
+- Skip inventory scanning when no active filter feature needs it.
+- Hold either keyboard ALT key to pick up filter-hidden items with the mouse.
+- Keep `/unhoarder perf` for performance reports; use QOL rev.89 when combining the plugins.
+
+Live loot performance improved in user testing. Automated checks pass; full ALT,
+controller and hosted interaction coverage remains open.
+
 ## 1.2.9 - background opacity compatibility
 
 - Apply filter backgrounds regardless of the native black-label opacity.

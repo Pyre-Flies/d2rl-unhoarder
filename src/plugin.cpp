@@ -10,8 +10,12 @@
 #include "controller_ground_label_witnesses.hpp"
 #include "ground_visibility_policy.hpp"
 #include "native_pickup_guard_policy.hpp"
+#include "native_pickup_profile.hpp"
 #include "ground_visibility_service.hpp"
+#include "ground_label_visibility_service.h"
+#include "guarded_local_read.hpp"
 #include "filter_rule_engine.hpp"
+#include "ground_action_demand.hpp"
 #include "base_name_table.hpp"
 #include "item_type_table.hpp"
 #include "ground_property_reader.hpp"
@@ -32,6 +36,7 @@
 #include "native_row_font_color_policy.hpp"
 #include "ground_sound_registry.hpp"
 #include "named_sound_loader_identity.hpp"
+#include "loot_performance.hpp"
 #include "../interop/unhoarder_tooltip_compat_v1.hpp"
 #include "../interop/unit_stat_read_compat_v1.hpp"
 #include "../interop/in_world_item_label_compat_v1.hpp"
@@ -643,6 +648,14 @@ bool GroundCandidatePageReadable(std::uintptr_t address,
     if(address<0x10000 || (address&7U)!=0 ||
         address>std::numeric_limits<std::uintptr_t>::max()-bytes)
         return false;
+    DWORD currentProtection{};
+    if(CurrentPageQuery::SinglePage(address,bytes,0,currentProtection)) {
+        if(currentProtection&(PAGE_GUARD|PAGE_NOACCESS))return false;
+        const auto readable=currentProtection&0xFFU;
+        return readable==PAGE_READONLY || readable==PAGE_READWRITE ||
+            readable==PAGE_WRITECOPY || readable==PAGE_EXECUTE_READ ||
+            readable==PAGE_EXECUTE_READWRITE || readable==PAGE_EXECUTE_WRITECOPY;
+    }
     MEMORY_BASIC_INFORMATION page{};
     if(VirtualQuery(reinterpret_cast<const void*>(address),&page,
             sizeof(page))!=sizeof(page) || page.State!=MEM_COMMIT ||
@@ -998,6 +1011,7 @@ void ObserveMinimapItemPosition(const void* nativeUnit,std::uint32_t rawCode,
     std::uint32_t unitId,std::uint32_t classId) noexcept {
     if(!AutomapProjectionArmed.load(std::memory_order_acquire) || !nativeUnit ||
        !unitId || !PrintableItemCode(rawCode)) return;
+    Perf::Scope timing(Perf::Counters[Perf::MinimapPosition]);
     std::array<std::uint8_t,MinimapUnitBytes> first{},last{};
     std::array<std::uint8_t,MinimapPathBytes> pathFirst{},pathLast{};
     SIZE_T copied{};
@@ -1045,6 +1059,7 @@ GroundPropertyLive::Scalars ReadNativeGroundQualityLevel(
     const char** reason=nullptr,
     bool includeEthereal=false,
     bool includeIdentified=false) noexcept {
+    Perf::Scope timing(Perf::Counters[Perf::Quality]);
     const auto fail=[reason](const char* why) noexcept
         -> GroundPropertyLive::Scalars {
         if(reason)*reason=why;
@@ -1074,18 +1089,21 @@ GroundPropertyLive::Scalars ReadNativeGroundQualityLevel(
         return fail("item-data-page-not-readable");
     std::array<std::uint8_t,length> itemData{},check{};
     copied=0;
-    if(!ReadProcessMemory(GetCurrentProcess(),
-            reinterpret_cast<const void*>(address),itemData.data(),
-            itemData.size(),&copied) || copied!=itemData.size())
+    // The complete current span was page-qualified immediately above. Keep
+    // both property observations and fault containment, without an API copy.
+    if(!GuardedLocalRead::Detail::CopyReadable(
+            reinterpret_cast<const void*>(address),itemData.data(),itemData.size()))
         return fail("item-data-first-read-failed");
     copied=0;
     if(!ReadProcessMemory(GetCurrentProcess(),nativeUnit,after.data(),
             after.size(),&copied) || copied!=after.size() ||
        before!=after) return fail("unit-changed-during-read");
     copied=0;
-    if(!ReadProcessMemory(GetCurrentProcess(),
-            reinterpret_cast<const void*>(address),check.data(),
-            check.size(),&copied) || copied!=check.size())
+    // Re-qualify after the intervening unit read; never reuse a page proof.
+    if(!GroundCandidatePageReadable(address,length))
+        return fail("item-data-second-page-not-readable");
+    if(!GuardedLocalRead::Detail::CopyReadable(
+            reinterpret_cast<const void*>(address),check.data(),check.size()))
         return fail("item-data-second-read-failed");
     if(GroundPropertyReader::ReadLe32(itemData.data())!=
            GroundPropertyReader::ReadLe32(check.data()) ||
@@ -1123,6 +1141,7 @@ constexpr std::int32_t GroundSocketStatId=194;
 bool ReadNativeGroundSockets(const void* nativeUnit,
     std::uint32_t expectedId,std::uint32_t expectedClassId,
     GroundPropertyLive::Purpose purpose,std::uint32_t& sockets) noexcept {
+    Perf::Scope timing(Perf::Counters[Perf::Sockets]);
     sockets=0; // meaningful ONLY when the return value is true
     if(!nativeUnit || !expectedId || !Context ||
        !ResolveBuildName(Context) ||
@@ -1168,12 +1187,14 @@ bool ReadNativeGroundSockets(const void* nativeUnit,
 bool ReadNativeVendorSellPrice(const void* nativeUnit,
     std::uint32_t expectedId,std::uint32_t expectedClassId,std::uint32_t code,
     GroundPropertyLive::Purpose purpose,std::uint32_t& price,
-    RuleEngine::Item* itemSnapshot=nullptr) noexcept;
+    RuleEngine::Item* itemSnapshot,std::uint64_t rulesGeneration) noexcept;
 
 RuleEngine::Item GroundRuleItem(std::uint32_t code,const void* nativeUnit,
     const FilterRuleTable* table,std::uint32_t expectedId=0,
     GroundPropertyLive::Purpose purpose=
-        GroundPropertyLive::Purpose::StrictGround) noexcept {
+        GroundPropertyLive::Purpose::StrictGround,
+    bool geometryActionsOnly=false) noexcept {
+    Perf::Scope timing(Perf::Counters[Perf::Properties]);
     RuleEngine::Item item{};
     item.code=CanonicalItemCode(code);
     if (!nativeUnit) return item;
@@ -1199,6 +1220,7 @@ RuleEngine::Item GroundRuleItem(std::uint32_t code,const void* nativeUnit,
     // then re-evaluate. Unknown native values stop property-dependent matching
     // so a later broad Hide cannot turn an unreadable item into a false match.
     for(unsigned propertyGroup=0;propertyGroup<5 && table;++propertyGroup) {
+        if(geometryActionsOnly && !UnHoarder::GroundActionDemand::GeometryPossible(table->rules,item))break;
         const auto next=RuleEngine::NextNativeProperty(table->rules,item);
         if(next==RuleEngine::NextProperty::None) break;
 
@@ -1245,7 +1267,7 @@ RuleEngine::Item GroundRuleItem(std::uint32_t code,const void* nativeUnit,
         if(next==RuleEngine::NextProperty::SellPrice) {
             std::uint32_t sellPrice{};
             if(!ReadNativeVendorSellPrice(nativeUnit,header[2],header[1],
-                    item.code,purpose,sellPrice,&item))
+                    item.code,purpose,sellPrice,&item,table->generation))
                 break;
             item.sellPriceKnown=true;
             item.sellPrice=sellPrice;
@@ -1331,6 +1353,8 @@ void MergeGroundRuleAction(GroundRuleDecision& output,
 
 bool ResolveGroundRule(const FilterRuleTable* table,
     const RuleEngine::Item& item,GroundRuleDecision& output) noexcept {
+    Perf::Scope timing(Perf::Counters[Perf::Rules]);
+    timing.Items(table?table->rules.size():0);
     output={};
     if(!table) return false;
     return RuleEngine::ResolveMatchingRulesFailOpen(table->rules,item,
@@ -1522,6 +1546,7 @@ struct VendorSellPriceCacheEntry final {
     std::uint32_t unitId{},classId{},code{},price{};
     std::uintptr_t nativeUnit{};
     ULONGLONG observedMs{};
+    std::uint64_t rulesGeneration{};
     bool valid{};
 };
 std::array<VendorSellPriceCacheEntry,VendorSellPriceCacheCapacity>
@@ -1583,18 +1608,19 @@ void ForgetVendorSellPriceItem(std::uint32_t unitId) noexcept {
     // being dropped again with the same runtime ID. The cache is tiny and
     // lookup/store never hold this lock across a native call.
     std::lock_guard lock(VendorSellPriceCacheMutex);
-    for(auto& entry:VendorSellPriceCache)
-        if(entry.valid && entry.unitId==unitId) entry={};
+    auto& entry=VendorSellPriceCache[
+        static_cast<std::size_t>(unitId)%VendorSellPriceCache.size()];
+    if(entry.valid && entry.unitId==unitId) entry={};
 }
 
 bool TryGetCachedVendorSellPrice(std::uint32_t unitId,std::uint32_t classId,
-    std::uint32_t code,const void* nativeUnit,std::uint32_t& price,
+    std::uint32_t code,const void* nativeUnit,std::uint64_t rulesGeneration,std::uint32_t& price,
     ULONGLONG& observedMs) noexcept {
     if(!VendorSellPriceCacheMutex.try_lock()) return false;
     const auto& entry=VendorSellPriceCache[
         static_cast<std::size_t>(unitId)%VendorSellPriceCache.size()];
     const auto now=GetTickCount64();
-    const bool hit=entry.valid && entry.unitId==unitId &&
+    const bool hit=entry.valid && entry.unitId==unitId && entry.rulesGeneration==rulesGeneration &&
         entry.classId==classId && entry.code==code &&
         entry.nativeUnit==reinterpret_cast<std::uintptr_t>(nativeUnit) &&
         now>=entry.observedMs && now-entry.observedMs<=VendorSellPriceCacheTtlMs;
@@ -1608,12 +1634,12 @@ bool TryGetCachedVendorSellPrice(std::uint32_t unitId,std::uint32_t classId,
 
 void StoreVendorSellPrice(std::uint32_t unitId,std::uint32_t classId,
     std::uint32_t code,const void* nativeUnit,std::uint32_t price,
-    ULONGLONG observedMs) noexcept {
+    ULONGLONG observedMs,std::uint64_t rulesGeneration) noexcept {
     if(!VendorSellPriceCacheMutex.try_lock()) return;
     VendorSellPriceCache[
         static_cast<std::size_t>(unitId)%VendorSellPriceCache.size()]=
         {unitId,classId,code,price,reinterpret_cast<std::uintptr_t>(nativeUnit),
-            observedMs,true};
+            observedMs,rulesGeneration,true};
     VendorSellPriceCacheMutex.unlock();
 }
 
@@ -1658,7 +1684,7 @@ bool VendorSellPriceContext(void*& player,std::uint8_t& difficulty,
 bool ReadNativeVendorSellPrice(const void* nativeUnit,
     std::uint32_t expectedId,std::uint32_t expectedClassId,std::uint32_t code,
     GroundPropertyLive::Purpose purpose,std::uint32_t& price,
-    RuleEngine::Item* itemSnapshot) noexcept {
+    RuleEngine::Item* itemSnapshot,std::uint64_t rulesGeneration) noexcept {
     price=0;
     if(!nativeUnit || !expectedId || !code ||
        !VendorSellPriceQualified.load(std::memory_order_acquire))
@@ -1666,7 +1692,7 @@ bool ReadNativeVendorSellPrice(const void* nativeUnit,
 
     ULONGLONG observedMs{};
     if(TryGetCachedVendorSellPrice(
-            expectedId,expectedClassId,code,nativeUnit,price,observedMs)) {
+            expectedId,expectedClassId,code,nativeUnit,rulesGeneration,price,observedMs)) {
         if(itemSnapshot) itemSnapshot->sellPriceObservedMs=observedMs;
         return true;
     }
@@ -1723,7 +1749,7 @@ bool ReadNativeVendorSellPrice(const void* nativeUnit,
     observedMs=GetTickCount64();
     if(itemSnapshot) itemSnapshot->sellPriceObservedMs=observedMs;
     StoreVendorSellPrice(expectedId,expectedClassId,code,nativeUnit,price,
-        observedMs);
+        observedMs,rulesGeneration);
     return true;
 }
 
@@ -3330,6 +3356,7 @@ std::uint64_t __fastcall HookInnerNameWriter(
         !unit || !output || bufferSize != InnerNameBufferBytes ||
         !OriginalGetItemCode || !HookInstalled.load(std::memory_order_acquire))
         return result;
+    Perf::Scope timing(Perf::Counters[Perf::Name]);
     const auto outputAddress = reinterpret_cast<std::uintptr_t>(output);
     if (outputAddress < 0x24 || outputAddress > UINTPTR_MAX - 4) {
         return result;
@@ -3353,7 +3380,6 @@ std::uint64_t __fastcall HookInnerNameWriter(
         return result;
     }
     const auto code = CanonicalItemCode(OriginalGetItemCode(unit)); // original helper trampoline
-    ObserveMinimapItemPosition(unit,code,recordId,header[1]);
     const char* configuredName = nullptr;
     std::size_t configuredBytes = 0;
     std::shared_ptr<const FilterRuleTable> snapshot;
@@ -3364,10 +3390,15 @@ std::uint64_t __fastcall HookInnerNameWriter(
         snapshot = PublishedFilterRules.load(std::memory_order_acquire);
         if (snapshot) {
             const auto ruleItem=GroundRuleItem(code,unit,snapshot.get(),header[2],
-                GroundPropertyLive::Purpose::VerifiedLabel);
+                GroundPropertyLive::Purpose::VerifiedLabel,true);
             GroundRuleDecision resolvedRule{};
             const auto* rule=ResolveGroundRule(snapshot.get(),ruleItem,resolvedRule) ?
                 &resolvedRule : nullptr;
+            // Resolve the icon before sampling coordinates. No-icon outcomes
+            // still clear the old icon below; icon paths retain every guard.
+            if(rule && rule->hasMinimapIcon)
+                ObserveMinimapItemPosition(unit,code,recordId,header[1]);
+            else Perf::Counters[Perf::MinimapPositionSkipped].Record(0,1);
             UpdateMinimapProjectionIconRule(header[2],code,rule);
             if (rule && rule->hasName) {
                 configuredName=rule->name.data();
@@ -3474,11 +3505,96 @@ void ArmInnerNameWriter() noexcept {
 // Record identity at the only point with a verified native item pointer.
 // The painter may read a separate label record, so match unit ID, recent
 // formatter observation, and exact label text; NEVER compare record pointers.
+// A one-way, invocation-local handoff from a freshly guarded visibility query
+// to the SAME formatter's presentation identity. Pickup queries never consume
+// this observation. No property, native admission or page proof survives the
+// formatter, and no native pointer is retained by the resulting paint identity.
+std::atomic<std::uint64_t> GroundFormatterEpoch{};
+struct GroundFormatterObservation;
+thread_local GroundFormatterObservation* CurrentGroundFormatter{};
+struct GroundFormatterObservation final {
+    GroundFormatterObservation* previous{};
+    const void* unit{};
+    const void* output{};
+    std::uint64_t epoch{},serial{};
+    bool eligible{},available{};
+    std::array<std::uint32_t,6> header{}; // identity + item-data pointer
+    std::shared_ptr<const FilterRuleTable> rules;
+    RuleEngine::Item item{};
+    GroundFormatterObservation(const void* u,const void* out,bool qualified) noexcept
+        : previous(CurrentGroundFormatter),unit(u),output(out),
+          epoch(GroundFormatterEpoch.load(std::memory_order_acquire)),eligible(qualified) {
+        // A nested native formatter invalidates any outer handoff, even when
+        // its eventual label is not eligible. Restore scope, never old data.
+        if(previous){previous->available=false;++previous->serial;}
+        CurrentGroundFormatter=this;
+    }
+    ~GroundFormatterObservation() noexcept {CurrentGroundFormatter=previous;}
+    GroundFormatterObservation(const GroundFormatterObservation&)=delete;
+    GroundFormatterObservation& operator=(const GroundFormatterObservation&)=delete;
+};
+bool ReadGroundFormatterHeader(const void* unit,std::array<std::uint32_t,6>& header) noexcept {
+    SIZE_T copied{};
+    return unit && ReadProcessMemory(GetCurrentProcess(),unit,header.data(),sizeof(header),&copied) &&
+        copied==sizeof(header) && header[0]==4 && header[2] && header[3]==3;
+}
+struct GroundFormatterCapture final {
+    GroundFormatterObservation* scope{};
+    std::uint64_t serial{};
+    std::uint32_t code{};
+    std::array<std::uint32_t,6> header{};
+    std::shared_ptr<const FilterRuleTable> rules;
+    GroundFormatterCapture(const void* unit,std::uint32_t id,std::uint32_t c,
+        const std::shared_ptr<const FilterRuleTable>& table) noexcept
+        : scope(CurrentGroundFormatter),code(c),rules(table) {
+        if(!scope)return;
+        scope->available=false;serial=++scope->serial;
+        if(!scope->eligible || scope->unit!=unit || !rules || rules->usesQuantity || rules->usesSellPrice ||
+           !ReadGroundFormatterHeader(unit,header) ||
+           header[2]!=id)scope=nullptr;
+    }
+    void Publish(const RuleEngine::Item& observed) noexcept {
+        std::array<std::uint32_t,6> after{};
+        if(!scope || CurrentGroundFormatter!=scope || serial!=scope->serial ||
+           scope->epoch!=GroundFormatterEpoch.load(std::memory_order_acquire) ||
+           !ReadGroundFormatterHeader(scope->unit,after) || after!=header ||
+           rules!=PublishedFilterRules.load(std::memory_order_acquire) ||
+           !HookInstalled.load(std::memory_order_acquire) ||
+           !HideGroundArmed.load(std::memory_order_acquire) ||
+           ActiveGeometryMode.load(std::memory_order_acquire)!=GeometryMode::Rules ||
+           !OriginalGetItemCode || CanonicalItemCode(OriginalGetItemCode(const_cast<void*>(scope->unit)))!=code)
+            return;
+        scope->header=header;scope->rules=rules;scope->item=observed;scope->available=true;
+        Perf::Counters[Perf::FormatterObservation].Record(0,1);
+    }
+};
+bool ConsumeGroundFormatterObservation(const void* unit,const void* record,
+    std::uint32_t id,std::uint32_t code,const std::shared_ptr<const FilterRuleTable>& rules,
+    RuleEngine::Item& item) noexcept {
+    auto* scope=CurrentGroundFormatter;
+    if(!scope || !scope->available)return false;
+    scope->available=false; // exactly one presentation consumer
+    const auto address=reinterpret_cast<std::uintptr_t>(record);
+    std::array<std::uint32_t,6> current{};
+    if(!scope->eligible || scope->unit!=unit || address>UINTPTR_MAX-0x24 ||
+       scope->output!=reinterpret_cast<const void*>(address+0x24) ||
+       scope->rules!=rules || rules!=PublishedFilterRules.load(std::memory_order_acquire) ||
+       scope->epoch!=GroundFormatterEpoch.load(std::memory_order_acquire) ||
+       scope->header[2]!=id || scope->item.code!=code ||
+       !HookInstalled.load(std::memory_order_acquire) || !HideGroundArmed.load(std::memory_order_acquire) ||
+       ActiveGeometryMode.load(std::memory_order_acquire)!=GeometryMode::Rules ||
+       !ReadGroundFormatterHeader(unit,current) || current!=scope->header)return false;
+    item=scope->item;
+    Perf::Counters[Perf::FormatterReuse].Record(0,1);
+    return true;
+}
+
 void RememberGroundIdentity(void* unit, void* record, bool sourceCall,
                            bool paired, std::uint8_t result, bool controller=false) noexcept {
     if (ActiveGeometryMode.load(std::memory_order_acquire)!=GeometryMode::Rules ||
         !sourceCall || !paired || !result || !unit || !record ||
         !OriginalGetItemCode || !HookInstalled.load(std::memory_order_acquire)) return;
+    Perf::Scope timing(Perf::Counters[Perf::Identity]);
     std::uint32_t header[3]{},recordId{};
     SIZE_T copied{};
     const auto address=reinterpret_cast<std::uintptr_t>(record);
@@ -3500,8 +3616,12 @@ void RememberGroundIdentity(void* unit, void* record, bool sourceCall,
     const auto code=CanonicalItemCode(OriginalGetItemCode(unit));
     const auto table=PublishedFilterRules.load(std::memory_order_acquire);
     if (!table) return;
-    const auto scalars=GroundRuleItem(code,unit,table.get(),recordId,
-        GroundPropertyLive::Purpose::VerifiedLabel);
+    RuleEngine::Item scalars{};
+    if(!ConsumeGroundFormatterObservation(unit,record,recordId,code,table,scalars)) {
+        Perf::Counters[Perf::FormatterFallback].Record(0,1);
+        scalars=GroundRuleItem(code,unit,table.get(),recordId,
+            GroundPropertyLive::Purpose::VerifiedLabel);
+    }
     GroundRuleDecision resolvedRule{};
     const auto* selected=ResolveGroundRule(table.get(),scalars,resolvedRule) ?
         &resolvedRule : nullptr;
@@ -3612,6 +3732,7 @@ void __cdecl UnHoarderSharedLabelPaintMiddleware(
     const bool ground=caller==Base+0x1517AF6 ||
         (ControllerGroundLabelsReady.load(std::memory_order_acquire) &&
          caller==Base+ControllerGroundLabel::PaintReturn);
+    const auto styleStarted=ground?LootPerf::Now():0;
     const bool rulesActive=ActiveGeometryMode.load(std::memory_order_acquire)==GeometryMode::Rules;
     const bool tint=rulesActive && BackgroundTintArmed.load(std::memory_order_acquire);
     const bool hide=rulesActive && HideGroundArmed.load(std::memory_order_acquire);
@@ -3689,6 +3810,10 @@ void __cdecl UnHoarderSharedLabelPaintMiddleware(
     const float* const previousGlyphColor=VerifiedRuleGlyphColor;
     VerifiedRuleGlyphColor=concealGroundVisuals ? invisibleRgba.data() :
         (ground && hasScopedRuleTextColor?scopedRuleTextColor.data():nullptr);
+    if(ground) {
+        const auto ended=LootPerf::Now();
+        Perf::Counters[Perf::Style].Record(ended>=styleStarted?ended-styleStarted:0,1);
+    }
 
     // A qualified show:false bulk-ground label omits the remainder of the
     // middleware chain. Pickup suppression is enforced independently.
@@ -3916,6 +4041,9 @@ const D2RL::PluginCommunicationService* ResolvePluginCommunication() noexcept {
 
 UnhoarderVisibility::Decision __cdecl QueryGroundVisibility(
     const void* unit,std::uint32_t guid,std::uint32_t code) noexcept {
+    // Even an early failed/reentrant query retires an earlier presentation witness.
+    if(CurrentGroundFormatter){CurrentGroundFormatter->available=false;++CurrentGroundFormatter->serial;}
+    Perf::Scope timing(Perf::Counters[Perf::Visibility]);
     using D=UnhoarderVisibility::Decision;
     code=CanonicalItemCode(code);
     if(!unit || !guid || !PrintableItemCode(code) || !OriginalGetItemCode ||
@@ -3932,6 +4060,7 @@ UnhoarderVisibility::Decision __cdecl QueryGroundVisibility(
         return D::Unknown;
     auto* mutableUnit=const_cast<void*>(unit);
     if(CanonicalItemCode(OriginalGetItemCode(mutableUnit))!=code) return D::Unknown;
+    GroundFormatterCapture presentation(unit,guid,code,rules);
     const auto item=GroundRuleItem(code,mutableUnit,rules.get(),guid);
     GroundRuleDecision decision{};
     const bool matched=ResolveGroundRule(rules.get(),item,decision);
@@ -3942,10 +4071,45 @@ UnhoarderVisibility::Decision __cdecl QueryGroundVisibility(
        ActiveGeometryMode.load(std::memory_order_acquire)!=GeometryMode::Rules)
         return D::Unknown;
     if(!matched) return D::Unknown;
+    presentation.Publish(item); // presentation only; never an input to this query
     return decision.show?D::Visible:D::Hidden;
 }
 const UnhoarderVisibility::Service PublishedVisibilityService{
     sizeof(UnhoarderVisibility::Service),UnhoarderVisibility::Version,&QueryGroundVisibility};
+// No copied mutable properties or cached native admission. This callback only
+// proves that the current code excludes EVERY Hide rule in the current snapshot.
+// All other outcomes require the original guarded QOL visibility query.
+UnhoarderLabelVisibility::Decision __cdecl QueryLabelCannotHide(
+    const void* unit,std::uint32_t guid) noexcept {
+    Perf::Scope timing(Perf::Counters[Perf::LabelPreflight]);
+    using D=UnhoarderLabelVisibility::Decision;
+    if(!unit || !guid || !OriginalGetItemCode ||
+       !HookInstalled.load(std::memory_order_acquire))return D::RequireQuery;
+    if(!HideGroundArmed.load(std::memory_order_acquire) ||
+       ActiveGeometryMode.load(std::memory_order_acquire)!=GeometryMode::Rules)return D::CannotHide;
+    const auto rules=PublishedFilterRules.load(std::memory_order_acquire);
+    if(!rules)return D::RequireQuery;
+    std::array<std::uint32_t,4> before{},after{};SIZE_T copied{};
+    if(!ReadProcessMemory(GetCurrentProcess(),unit,before.data(),sizeof(before),&copied) ||
+       copied!=sizeof(before) || before[0]!=4 || before[2]!=guid || before[3]!=3)return D::RequireQuery;
+    auto* mutableUnit=const_cast<void*>(unit);
+    const auto code=CanonicalItemCode(OriginalGetItemCode(mutableUnit));
+    if(!PrintableItemCode(code))return D::RequireQuery;
+    RuleEngine::Item item{};item.code=code;item.classIdKnown=true;item.classId=before[1];
+    if(UnHoarder::GroundActionDemand::HidePossible(rules->rules,item))return D::RequireQuery;
+    // The borrowed item's identity and code, the rule snapshot and presentation
+    // arming are checked again before the caller may skip any work.
+    if(CanonicalItemCode(OriginalGetItemCode(mutableUnit))!=code ||
+       !ReadProcessMemory(GetCurrentProcess(),unit,after.data(),sizeof(after),&copied) ||
+       copied!=sizeof(after) || before!=after ||
+       rules!=PublishedFilterRules.load(std::memory_order_acquire) ||
+       !HideGroundArmed.load(std::memory_order_acquire) ||
+       ActiveGeometryMode.load(std::memory_order_acquire)!=GeometryMode::Rules)return D::RequireQuery;
+    Perf::Counters[Perf::LabelNoHide].Record(0,1);
+    return D::CannotHide;
+}
+const UnhoarderLabelVisibility::Service PublishedLabelVisibilityService{
+    sizeof(UnhoarderLabelVisibility::Service),UnhoarderLabelVisibility::Version,&QueryLabelCannotHide};
 void PublishGroundVisibilityService() noexcept {
     const auto* service=ResolvePluginCommunication();
     if(!service || !service->publishService) return;
@@ -3955,6 +4119,12 @@ void PublishGroundVisibilityService() noexcept {
         .tableSize=sizeof(PublishedVisibilityService),.table=&PublishedVisibilityService};
     if(service->publishService(Context,&request)==D2RL::PluginCommunication::Result::Success)
         LogInfo("LOOT_VISIBILITY_SERVICE_READY abi=1 presentation-only=1 native-pickup=unchanged");
+    const D2RL::PluginCommunication::PublishServiceRequest labelRequest{
+        .structSize=D2RL::PluginCommunication::PublishServiceRequestSize,.flags=0,
+        .name=UnhoarderLabelVisibility::Name,.serviceVersion=UnhoarderLabelVisibility::Version,
+        .tableSize=sizeof(PublishedLabelVisibilityService),.table=&PublishedLabelVisibilityService};
+    if(service->publishService(Context,&labelRequest)==D2RL::PluginCommunication::Result::Success)
+        LogInfo("LOOT_LABEL_PREFLIGHT_SERVICE_READY abi=1 no-hide-proof-only=1 mutable-properties-cached=0 native-pickup=unchanged");
 }
 
 void PublishTooltipCompatService() noexcept {
@@ -4061,7 +4231,6 @@ void __cdecl OnCompatibleInWorldLabel(
     const auto code=CanonicalItemCode(
         OriginalGetItemCode(const_cast<void*>(event->nativeUnit)));
     if (!PrintableItemCode(code)) return;
-    ObserveMinimapItemPosition(event->nativeUnit,code,event->unitId,event->classId);
     ObserveNativeRowLiveLabel(event->unitType,event->classId,event->unitId,code,
         event->nativeUnit,event->source,event->sourceLength);
 }
@@ -4086,6 +4255,9 @@ bool __cdecl OnCompatibleInWorldStyle(
     GroundRuleDecision resolvedRule{};
     const auto* rule=ResolveGroundRule(snapshot.get(),observed,resolvedRule)
         ? &resolvedRule : nullptr;
+    if(rule && rule->hasMinimapIcon)
+        ObserveMinimapItemPosition(event->nativeUnit,code,event->unitId,event->classId);
+    else Perf::Counters[Perf::MinimapPositionSkipped].Record(0,1);
     UpdateMinimapProjectionIconRule(event->unitId,code,rule);
     const auto quantity=GroundStackQuantity(event->nativeUnit);
     const char palette=rule && rule->hasTextColor
@@ -4499,6 +4671,7 @@ std::uint64_t __cdecl UnHoarderGlyphRendererMiddleware(
     void*,std::uintptr_t caller,
     void* context,float x,float y,const float* nativeRgba,
     TooltipCompat::GlyphRendererNextFn next,void* nextContext) noexcept {
+    Perf::Scope timing(Perf::Counters[Perf::Glyph]);
     if (!next) return 0;
     std::uint64_t hiddenHoverColored{};
     if (TryForwardNativeRowFontGlyph(
@@ -5000,9 +5173,25 @@ bool ArmNativeDropSoundHook() noexcept {
 // observation, not on disappearance from the screen. The SDK returns copied
 // ItemInfo snapshots, so no item handles/pointers escape these callbacks.
 struct PickupPollResults final {
+    std::uint32_t visited{};
     std::uint32_t cleared{};
     std::uint32_t lastUnitId{};
+    struct Needs {
+        bool sound{},minimap{},sellPrice{};
+        explicit operator bool() const noexcept {return sound || minimap || sellPrice;}
+    } needs{};
 };
+
+PickupPollResults::Needs ReadPickupObservationNeeds() noexcept {
+    const auto rules=PublishedFilterRules.load(std::memory_order_acquire);
+    if(!rules || ActiveGeometryMode.load(std::memory_order_acquire)!=GeometryMode::Rules)
+        return {};
+    // Installed capabilities alone do not justify enumerating owned storage.
+    // The queued UI callback rechecks this demand after any intervening reload.
+    return {SoundArmed.load(std::memory_order_acquire),
+        rules->minimapIconRules!=0 && AutomapProjectionHookInstalled.load(std::memory_order_acquire),
+        rules->usesSellPrice};
+}
 
 void ForgetCarriedSoundItem(std::uint32_t unitId,
                             PickupPollResults& results) noexcept {
@@ -5025,10 +5214,11 @@ D2RL::Inventory::IterationAction __cdecl OnSoundInventoryItem(
         item->structSize < D2RL::Items::ItemInfoRequiredSize ||
         item->container == D2RL::Items::ItemContainer::Ground)
         return D2RL::Inventory::IterationAction::Continue;
-    ForgetMinimapProjectionItem(item->runtimeId);
-    ForgetVendorSellPriceItem(item->runtimeId);
-    ForgetCarriedSoundItem(item->runtimeId,
-        *static_cast<PickupPollResults*>(userData));
+    auto& results=*static_cast<PickupPollResults*>(userData);
+    ++results.visited;
+    if(results.needs.minimap) ForgetMinimapProjectionItem(item->runtimeId);
+    if(results.needs.sellPrice) ForgetVendorSellPriceItem(item->runtimeId);
+    if(results.needs.sound) ForgetCarriedSoundItem(item->runtimeId,results);
     return D2RL::Inventory::IterationAction::Continue;
 }
 
@@ -5039,17 +5229,15 @@ void __cdecl PollSoundInventoryOnUiThread(
     const auto finish=[]() noexcept {
         SoundPickupPollPending.store(false,std::memory_order_release);
     };
-    const auto rules=PublishedFilterRules.load(std::memory_order_acquire);
-    const bool sellPriceLifecycle=rules && rules->usesSellPrice;
-    if (!context ||
-        (!SoundArmed.load(std::memory_order_acquire) &&
-         !AutomapProjectionHookInstalled.load(std::memory_order_acquire) &&
-         !sellPriceLifecycle) ||
+    const auto needs=ReadPickupObservationNeeds();
+    if (!context || !needs ||
         !SoundInventory || !SoundInventory->getLocalPlayer ||
         !SoundInventory->forEachInventoryItem) {
         finish();
         return;
     }
+    Perf::Scope timing(Perf::Counters[Perf::Poll]);
+    timing.Items(0);
     D2RL::PlayerHandle player{};
     if (SoundInventory->getLocalPlayer(context,&player) !=
         D2RL::Inventory::Result::Success) {
@@ -5057,6 +5245,7 @@ void __cdecl PollSoundInventoryOnUiThread(
         return;
     }
     PickupPollResults results{};
+    results.needs=needs;
     constexpr auto carriedMask =
         D2RL::Items::ContainerBit(D2RL::Items::ItemContainer::Inventory) |
         D2RL::Items::ContainerBit(D2RL::Items::ItemContainer::Equipment) |
@@ -5068,8 +5257,12 @@ void __cdecl PollSoundInventoryOnUiThread(
     const D2RL::Inventory::ItemFilter filter{
         D2RL::Inventory::ItemFilterSize,0,carriedMask,0
     };
-    (void)SoundInventory->forEachInventoryItem(
-        context,player,&filter,&OnSoundInventoryItem,&results);
+    {
+        Perf::Scope enumeration(Perf::Counters[Perf::Enumeration]);
+        (void)SoundInventory->forEachInventoryItem(
+            context,player,&filter,&OnSoundInventoryItem,&results);
+        enumeration.Items(results.visited);
+    }
     // Cursor is not guaranteed to be included in inventory enumeration.
     // A ground pickup held on the cursor must also re-arm the original item.
     if (SoundInventory->getCursorItem && SoundInventoryItems &&
@@ -5083,11 +5276,13 @@ void __cdecl PollSoundInventoryOnUiThread(
                     D2RL::Items::Result::Success &&
                 info.structSize >= D2RL::Items::ItemInfoRequiredSize &&
                 info.container == D2RL::Items::ItemContainer::Cursor)
-                { ForgetMinimapProjectionItem(info.runtimeId);
-                  ForgetVendorSellPriceItem(info.runtimeId);
-                  ForgetCarriedSoundItem(info.runtimeId,results); }
+                { ++results.visited;
+                  if(needs.minimap) ForgetMinimapProjectionItem(info.runtimeId);
+                  if(needs.sellPrice) ForgetVendorSellPriceItem(info.runtimeId);
+                  if(needs.sound) ForgetCarriedSoundItem(info.runtimeId,results); }
         }
     }
+    timing.Items(results.visited);
     if (results.cleared) {
         char line[210]{};
         std::snprintf(line,sizeof(line),
@@ -5103,19 +5298,20 @@ void PollSoundInventoryLoop(std::stop_token stop) noexcept {
     while (!stop.stop_requested()) {
         std::this_thread::sleep_for(SoundPickupPollInterval);
         if (stop.stop_requested()) break;
-        const auto rules=PublishedFilterRules.load(std::memory_order_acquire);
-        const bool sellPriceLifecycle=rules && rules->usesSellPrice;
-        if (!Context ||
-            (!SoundArmed.load(std::memory_order_acquire) &&
-             !AutomapProjectionHookInstalled.load(std::memory_order_acquire) &&
-             !sellPriceLifecycle) ||
-            !SoundInventory || !SoundThreads || !SoundThreads->runOnUiThread)
+        Perf::Counters[Perf::PollWake].Record(0);
+        if (!Context || !ReadPickupObservationNeeds() ||
+            !SoundInventory || !SoundThreads || !SoundThreads->runOnUiThread) {
+            Perf::Counters[Perf::PollSkipped].Record(0);
             continue;
-        if (SoundPickupPollPending.exchange(true,std::memory_order_acq_rel))
+        }
+        if (SoundPickupPollPending.exchange(true,std::memory_order_acq_rel)) {
+            Perf::Counters[Perf::PollPending].Record(0);
             continue;
+        }
         if (SoundThreads->runOnUiThread(
                 Context,&PollSoundInventoryOnUiThread,nullptr) !=
             D2RL::Threads::Result::Success) {
+            Perf::Counters[Perf::PollDispatchFailure].Record(0);
             SoundPickupPollPending.store(false,std::memory_order_release);
         }
     }
@@ -5314,6 +5510,7 @@ void __cdecl ActivateFirstFilterOnGameThread(
 
     {
         std::lock_guard lock(GroundIdentityMutex);
+        GroundFormatterEpoch.fetch_add(1,std::memory_order_acq_rel);
         GroundIdentities.fill({});
     }
 
@@ -5441,6 +5638,7 @@ bool TryLiveFilterReload(const char* trigger) noexcept {
     // Invalidate copied ground-label identity before re-arming the new rules.
     {
         std::lock_guard lock(GroundIdentityMutex);
+        GroundFormatterEpoch.fetch_add(1,std::memory_order_acq_rel);
         GroundIdentities.fill({}); // no old styled-name/paint identity survives
     }
     const bool activated=ActivateConfiguredFilter(false);
@@ -5502,6 +5700,7 @@ std::uint8_t __fastcall HookLabelFormatter(
             controller=true;
         }
     }
+    GroundFormatterObservation observation(unit,dest,controller || (sourceCall && paired));
     const auto result = OriginalLabelFormatter(
         unit, dest, record, flags, stack5, stack6);
     if (controller) {
@@ -5574,12 +5773,32 @@ std::atomic_bool NativePickupGuardQualified{};
 thread_local bool NativePickupGuardInside=false;
 std::jthread RuntimeWorker{};
 
+bool KeyboardAltHeld() noexcept {
+    // Event-time state, not the low-bit press history or a polling deadline.
+    return PickupGuard::AltHeld(GetAsyncKeyState(VK_LMENU),GetAsyncKeyState(VK_RMENU));
+}
+
+bool KeyboardPickupMode() noexcept {
+    // The build-qualified UI manager is independent of Controller QOL. Leave
+    // controller policy to the controller input path; unknown state fails open.
+    std::uintptr_t manager{},again{};
+    std::uint32_t mode=~0U;SIZE_T copied{};
+    return ReadSafe(NativePickupProfile::ManagerSlotRva,&manager,sizeof(manager)) &&
+        manager && manager<=UINTPTR_MAX-0xe0 &&
+        ReadProcessMemory(GetCurrentProcess(),reinterpret_cast<void*>(manager+0xdc),
+            &mode,sizeof(mode),&copied) && copied==sizeof(mode) && mode==0 &&
+        ReadSafe(NativePickupProfile::ManagerSlotRva,&again,sizeof(again)) && again==manager;
+}
+
 PickupGuard::Decision QualifyGroundPickup(std::uint32_t action,void* player,
     std::uint32_t type,std::uint32_t id) noexcept {
+    Perf::Scope timing(Perf::Counters[Perf::Pickup]);
     if(!NativePickupGuardQualified.load(std::memory_order_acquire))
         return PickupGuard::Decision::GuardInactive;
     if(!PickupGuard::Candidate(action,type,id))
         return PickupGuard::Decision::InvalidTargetId;
+    if(KeyboardAltHeld()) return PickupGuard::Decision::AltOverride;
+    if(!KeyboardPickupMode()) return PickupGuard::Decision::NonKeyboardInput;
     if(!HideGroundArmed.load(std::memory_order_acquire))
         return PickupGuard::Decision::VisibilityNotArmed;
     if(ActiveGeometryMode.load(std::memory_order_acquire)!=GeometryMode::Rules)
@@ -5627,6 +5846,13 @@ PickupGuard::Decision QualifyGroundPickup(std::uint32_t action,void* player,
         &resolvedRule : nullptr;
     if(!matchedRule || matchedRule->show)
         return PickupGuard::Decision::NoHiddenRule;
+    // Code/property reads must not turn a recycled or moving unit into proof.
+    std::array<std::uint32_t,4> after{};copied=0;
+    if(!ReadProcessMemory(GetCurrentProcess(),unit,after.data(),sizeof(after),&copied) ||
+       copied!=sizeof(after) || after!=header)
+        return PickupGuard::Decision::InvalidUnit;
+    if(KeyboardAltHeld()) return PickupGuard::Decision::AltOverride;
+    if(!KeyboardPickupMode()) return PickupGuard::Decision::NonKeyboardInput;
     return PickupGuard::Decision::Blocked;
 }
 
@@ -5635,8 +5861,10 @@ void __fastcall HookNativeActionDispatch(std::uint32_t action,void* player,
     const bool pickup=action==PickupGuard::PickupAction &&
         type==PickupGuard::ItemUnitType;
     if(pickup &&
-       QualifyGroundPickup(action,player,type,id)==PickupGuard::Decision::Blocked)
+       QualifyGroundPickup(action,player,type,id)==PickupGuard::Decision::Blocked) {
+        Perf::Counters[Perf::PickupBlocked].Record(0,1);
         return;
+    }
     if(pickup) ForgetVendorSellPriceItem(id);
     OriginalNativeActionDispatch(action,player,type,id);
 }
@@ -5693,25 +5921,16 @@ void InstallNativePickupGuard() noexcept {
         return;
     }
 
-    // Take an exact live snapshot only after the immutable build/call-graph
-    // witnesses above pass. Reject an entry already owned by an obvious bridge;
-    // the loader performs the final expected-byte check during registration.
-    std::array<std::uint8_t,20> dispatchEntry{};
-    if(!ReadSafe(NativeActionDispatchRva,dispatchEntry.data(),
-            dispatchEntry.size()) ||
-       !((dispatchEntry[0]==0x40)||(dispatchEntry[0]==0x48)||
-         (dispatchEntry[0]>=0x50 && dispatchEntry[0]<=0x57)) ||
-       (dispatchEntry[0]==0x48 && dispatchEntry[1]==0xFF &&
-        dispatchEntry[2]==0x25) ||
-       !Context->CheckExpectedBytes(NativeActionDispatchRva,
-            dispatchEntry.data(),
-            static_cast<std::uint32_t>(dispatchEntry.size()))){
+    // Qualify the captured native body, not an arbitrary current prologue.
+    const auto& dispatchEntry=NativePickupProfile::Dispatch;
+    if(!Context->CheckExpectedBytes(NativeActionDispatchRva,
+            dispatchEntry,static_cast<std::uint32_t>(sizeof(dispatchEntry)))){
         LogWarn("LOOT_PICKUP_GUARD_INACTIVE version=" UNHOARDER_VERSION_STRING " reason=dispatch-entry-unqualified forward-only=1");
         return;
     }
 
     if(!Context->InstallInlineHook(NativeActionDispatchRva,
-            dispatchEntry.data(),static_cast<std::uint32_t>(dispatchEntry.size()),
+            dispatchEntry,static_cast<std::uint32_t>(sizeof(dispatchEntry)),
             HookNativeActionDispatch,&OriginalNativeActionDispatch) ||
        !OriginalNativeActionDispatch){
         LogWarn("LOOT_PICKUP_GUARD_INACTIVE version=" UNHOARDER_VERSION_STRING " reason=dispatch-hook-registration-failed forward-only=1");
@@ -5720,7 +5939,7 @@ void InstallNativePickupGuard() noexcept {
 
     NativePickupGuardQualified.store(true,std::memory_order_release);
     LogInfo("LOOT_PICKUP_GUARD_READY version=" UNHOARDER_VERSION_STRING " action=22 type=4 mode=3 "
-         "freshLookup=D2R+0x9A5D0 rule=show:false failOpen=1 stateWrites=0");
+         "freshLookup=D2R+0x9A5D0 rule=show:false override=keyboard-alt input=keyboard-only failOpen=1 stateWrites=0");
 }
 
 void RuntimeWorkerLoop(std::stop_token stop) noexcept {
@@ -5823,6 +6042,31 @@ void RuntimeWorkerStop() noexcept {
     }
 }
 
+D2RL::ConsoleCommandResult __cdecl PerformanceCommand(
+    D2R::Game::Client*,const D2RL::ConsoleCommandContext* command,void*) noexcept {
+    if(!command || (command->argsLength && !command->args) || command->argsLength>256)
+        return D2RL::ConsoleCommandResult::InvalidArguments;
+    auto args=std::string_view(command->args?command->args:"",command->argsLength);
+    const auto first=args.find_first_not_of(" \t\r\n");
+    if(first==std::string_view::npos)return D2RL::ConsoleCommandResult::InvalidArguments;
+    args=args.substr(first,args.find_last_not_of(" \t\r\n")-first+1);
+    if(args!="perf")return D2RL::ConsoleCommandResult::InvalidArguments;
+    const auto* logger=command->plugin?command->plugin:Context;
+    if(!logger)return D2RL::ConsoleCommandResult::Failed;
+    const auto rules=PublishedFilterRules.load(std::memory_order_acquire);
+    const auto needs=ReadPickupObservationNeeds();
+    char line[384]{};
+    std::snprintf(line,sizeof(line),
+        "LOOT_PERF_STATE version=" UNHOARDER_VERSION_STRING " filterLoaded=%u rules=%zu rulesActive=%u pollSound=%u pollMinimap=%u pollPrice=%u pollPending=%u",
+        rules?1U:0U,rules?rules->rules.size():0U,
+        ActiveGeometryMode.load(std::memory_order_acquire)==GeometryMode::Rules?1U:0U,
+        needs.sound?1U:0U,needs.minimap?1U:0U,needs.sellPrice?1U:0U,
+        SoundPickupPollPending.load(std::memory_order_acquire)?1U:0U);
+    logger->LogInfo(line);
+    logger->WriteConsoleMessage(line,D2RL::ConsoleMessageKind::Output);
+    Perf::Report(logger);
+    return D2RL::ConsoleCommandResult::Handled;
+}
 
 
 } // namespace
@@ -5841,6 +6085,8 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
         Context=nullptr;
         return false;
     }
+    if(!context->RegisterConsoleCommand("unhoarder",&PerformanceCommand,"UnHoarder: perf (read-only performance report)"))
+        LogWarn("LOOT_PERF_UNAVAILABLE reason=console-command-registration-refused");
     InWorldLifecycle = nullptr;
     InWorldJoinedListener = D2RL::Lifecycle::InvalidHandle;
     InWorldCompatService.store(nullptr,std::memory_order_relaxed);
@@ -5897,7 +6143,8 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
     TooltipGlyphSubscribers.store(std::shared_ptr<const std::vector<TooltipGlyphSubscriber>>{},std::memory_order_release);
     BackgroundPaintHookInstalled.store(false,std::memory_order_relaxed);
     OriginalSharedLabelPaint=nullptr;
-    GroundIdentities.fill({});
+    GroundFormatterEpoch.fetch_add(1,std::memory_order_acq_rel);
+        GroundIdentities.fill({});
     BackgroundTintArmed.store(false,std::memory_order_relaxed);
     HideGroundArmed.store(false,std::memory_order_relaxed);
     OriginalInnerNameWriter=nullptr;
@@ -5960,8 +6207,8 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
     else LogWarn("LOOT_FILTER_AUTO_INACTIVE reason=json-absent-or-invalid no-ground-label-feature-hooks=1");
     RegisterInWorldLifecycle();
     StartSoundInventoryObserver();
-    // Hide rules affect label presentation only; do not intercept pickup.
-    LogInfo("LOOT_HIDE_PRESENTATION_ONLY pickup-dispatch-hook=none targeted-label=native");
+    // Keyboard pickup uses fresh filter proof; either held ALT key overrides.
+    InstallNativePickupGuard();
     RuntimeWorkerStart();
 
     return true;

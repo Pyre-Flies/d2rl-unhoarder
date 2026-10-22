@@ -1,4 +1,7 @@
-# Unhoarder hide rules preserve pickup
+# Historical label-only hide policy (1.2.7 through 1.2.15)
+
+Superseded for keyboard/mouse pickup in 1.2.16 by the user-requested
+[ALT pickup policy](keyboard-alt-pickup.md). Presentation behavior remains.
 
 ## Cause and behavior
 

@@ -1,6 +1,8 @@
 #pragma once
 #include "maps_socket_contract.hpp"
 #include <windows.h>
+#include "guarded_local_read.hpp"
+#include "current_page_query.hpp"
 
 namespace UnHoarder::MapsSocket {
 // Only readable executable image sections belonging to this loaded companion
@@ -18,11 +20,22 @@ struct ImageMemory {
     }
     bool Open(HMODULE module) noexcept {
         base=reinterpret_cast<uintptr_t>(module);
+        // Fresh metadata per guard. Combine the usual PE header reads without
+        // retaining any page, section, byte, ownership or forwarding proof.
+        // Unusual layouts and inaccessible optional tails retain narrow reads.
+        unsigned char headerBytes[0x1000];
+        const bool headerReady=Copy(base,headerBytes,sizeof(headerBytes));
+        const auto headerCopy=[&](uintptr_t at,void* out,size_t bytes) noexcept {
+            if(headerReady && at>=base && at-base<=sizeof(headerBytes) && bytes<=sizeof(headerBytes)-(at-base)) {
+                std::memcpy(out,headerBytes+(at-base),bytes);return true;
+            }
+            return Copy(at,out,bytes);
+        };
         IMAGE_DOS_HEADER dos{};IMAGE_NT_HEADERS64 nt{};
-        if(!Copy(base,&dos,sizeof(dos)) || dos.e_magic!=IMAGE_DOS_SIGNATURE || dos.e_lfanew<0 || dos.e_lfanew>0x1000 ||
+        if(!headerCopy(base,&dos,sizeof(dos)) || dos.e_magic!=IMAGE_DOS_SIGNATURE || dos.e_lfanew<0 || dos.e_lfanew>0x1000 ||
            base>UINTPTR_MAX-static_cast<uintptr_t>(dos.e_lfanew))return false;
         const auto header=base+static_cast<uintptr_t>(dos.e_lfanew);
-        if(!Copy(header,&nt,sizeof(nt)) || nt.Signature!=IMAGE_NT_SIGNATURE ||
+        if(!headerCopy(header,&nt,sizeof(nt)) || nt.Signature!=IMAGE_NT_SIGNATURE ||
            nt.FileHeader.Machine!=IMAGE_FILE_MACHINE_AMD64 || nt.OptionalHeader.Magic!=IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
            nt.FileHeader.SizeOfOptionalHeader!=sizeof(IMAGE_OPTIONAL_HEADER64) ||
            !nt.FileHeader.NumberOfSections || nt.FileHeader.NumberOfSections>std::size(sections) ||
@@ -30,7 +43,7 @@ struct ImageMemory {
         size=nt.OptionalHeader.SizeOfImage;count=nt.FileHeader.NumberOfSections;
         const auto table=header+sizeof(nt);
         if(base>UINTPTR_MAX-size || table<base || table-base>size || count*sizeof(sections[0])>size-(table-base) ||
-           !Copy(table,sections,count*sizeof(sections[0])))return false;
+           !headerCopy(table,sections,count*sizeof(sections[0])))return false;
         for(unsigned i=0;i<count;++i) {
             const auto& section=sections[i];
             if(section.VirtualAddress>size || section.Misc.VirtualSize>size-section.VirtualAddress)return false;
@@ -57,6 +70,16 @@ struct ImageMemory {
             }
             if(!admitted)return false;
         }
+        DWORD currentProtection{};
+        if(CurrentPageQuery::SinglePage(address,bytes,
+                kind==Kind::Trampoline?0:base,currentProtection)) {
+            if(currentProtection&(PAGE_GUARD|PAGE_NOACCESS))return false;
+            const bool executable=(currentProtection&(PAGE_EXECUTE_READ|PAGE_EXECUTE_READWRITE|PAGE_EXECUTE_WRITECOPY))!=0;
+            const bool writable=(currentProtection&(PAGE_READWRITE|PAGE_WRITECOPY|PAGE_EXECUTE_READWRITE|PAGE_EXECUTE_WRITECOPY))!=0;
+            if(kind==Kind::Data?(executable || !writable):!executable)return false;
+            if(kind==Kind::Code && (currentProtection&(PAGE_EXECUTE_READWRITE|PAGE_EXECUTE_WRITECOPY)))return false;
+            return GuardedLocalRead::Detail::CopyReadable(reinterpret_cast<const void*>(address),output,bytes);
+        }
         for(auto cursor=address;cursor<address+bytes;) {
             MEMORY_BASIC_INFORMATION region{};
             if(!VirtualQuery(reinterpret_cast<void*>(cursor),&region,sizeof(region)) || region.State!=MEM_COMMIT ||
@@ -70,11 +93,33 @@ struct ImageMemory {
             if(region.RegionSize>UINTPTR_MAX-start || start+region.RegionSize<=cursor)return false;
             cursor=start+region.RegionSize;
         }
-        return Copy(address,output,bytes);
+        // The unchanged live kind/page/ownership checks above qualify every
+        // region. The copy still refuses a subsequent fault or decommit race.
+        return GuardedLocalRead::Detail::CopyReadable(reinterpret_cast<const void*>(address),output,bytes);
+    }
+    bool ReadPair(uintptr_t first,void* a,size_t aSize,uintptr_t second,void* b,size_t bSize,Kind kind) const noexcept {
+        if(!first || !second || !a || !b || !aSize || !bSize ||
+           first>UINTPTR_MAX-aSize || second>UINTPTR_MAX-bSize)return false;
+        const auto start=first<second?first:second;
+        const auto end=first+aSize>second+bSize?first+aSize:second+bSize;
+        const auto pageSize=CurrentPageQuery::SystemApi().pageSize;
+        unsigned char snapshot[512];
+        // One fresh proof for a covering range also proves both slices. Keep
+        // unusual sections/pages on the original narrow path; retain nothing
+        // across calls, guards, or the native property invocation.
+        if(end-start<=sizeof(snapshot) && pageSize && start/pageSize==(end-1)/pageSize &&
+           Read(start,snapshot,end-start,kind)) {
+            std::memcpy(a,snapshot+(first-start),aSize);
+            std::memcpy(b,snapshot+(second-start),bSize);
+            return true;
+        }
+        return Read(first,a,aSize,kind) && Read(second,b,bSize,kind);
     }
     Memory Reader() noexcept {
         return {this,[](void* user,uintptr_t address,void* output,size_t bytes,Kind kind) noexcept {
             return static_cast<ImageMemory*>(user)->Read(address,output,bytes,kind);
+        },[](void* user,uintptr_t first,void* a,size_t aSize,uintptr_t second,void* b,size_t bSize,Kind kind) noexcept {
+            return static_cast<ImageMemory*>(user)->ReadPair(first,a,aSize,second,b,bSize,kind);
         }};
     }
 };

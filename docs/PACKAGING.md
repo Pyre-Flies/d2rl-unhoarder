@@ -18,5 +18,7 @@ that clean source or a supported post-restore override so the filter routing
 survives package preparation. A DLL-only update cannot install these table edits.
 
 Keep author credits, GPL-3.0 and dependency notices with redistribution, and
-provide the corresponding source. This branch contains staged source changes;
-no release workflow or new binary release was run as part of this publication.
+provide the corresponding source. Version 1.2.16 is distributed as a Reimagined
+upgrade ZIP and corresponding-source archive. Its exact DLL is paired with
+Controller QOL rev.89; rebuilding the same version does not automatically
+establish that companion's artifact compatibility.

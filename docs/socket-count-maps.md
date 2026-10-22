@@ -128,3 +128,22 @@ and launcher-clean sound tables retain SHA256
 `B9303D841EBC26B22BFB2471C199659D880EAC5D456B01C6859DAC35C005A8A1`.
 The new DLLs have not yet been loaded in game; visible rare-sword hiding remains
 pending a restart and gameplay check.
+
+
+## 1.2.16: fresh paired witness reads
+
+`Memory` has an optional pair reader with narrow-read fallback. Each guard can
+combine Head/Gate, the original/level pointer slots, and Index/Negative into one
+fresh bounded snapshot per pair. The production reader only combines ranges on
+one hardware page within 512 bytes, using the unchanged section/kind/current
+protection/allocation-owner checks and fault-contained copy. Optional gaps or
+unusual sections/pages fall back to both original narrow reads. Nothing is
+retained between pairs, guards, property calls or frames.
+
+Every compared byte, RIP-relative operand, pointer alignment and continuation
+predicate remains. The four before/after guards and two equal socket values are
+unchanged. A private-process before/after run measured four guards at 59.834 vs
+44.654 microseconds (7 samples of 2,000 iterations), about 25% lower. This is
+routine cost, not a predicted FPS gain. Tests cover fresh mutation observations,
+code/data kind, allocation owner, guard/no-access/read-only pages, overflow,
+wide/cross-page fallback, and the full graph's byte mutations/native execution.
